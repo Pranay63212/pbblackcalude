@@ -407,8 +407,13 @@ def main(argv=None) -> int:
     rp.add_argument("--smt-data", default=None)
     rp.add_argument("--date", required=True, help="CT date, e.g. 2024-03-12")
     rp.add_argument("--tz", default="UTC")
+    for sp in (lv, rp):
+        sp.add_argument("--daily-limits", choices=["spec", "relaxed"], default="spec",
+                        help="spec = strategy rules (default); relaxed = keep trading after wins/losses")
+        sp.add_argument("--session", choices=["spec", "extended"], default="spec",
+                        help="spec = signals 08:30-10:00 CT (default); extended = until 14:30 CT")
     args = ap.parse_args(argv)
-    cfg = default_config()
+    cfg = default_config(args.daily_limits, args.session)
 
     if args.mode == "replay":
         try:

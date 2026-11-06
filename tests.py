@@ -1348,6 +1348,91 @@ class TestUnattendedRunning(unittest.TestCase):
             urllib.request.urlopen = orig
 
 
+class TestProfiles(unittest.TestCase):
+    """Opt-in variations; the default must stay exactly the strategy document."""
+
+    def test_default_is_the_spec(self):
+        from config import EXECUTION_CONFIG
+        cfg = default_config()
+        self.assertEqual(cfg["execution"]["daily_limits"], EXECUTION_CONFIG["daily_limits"])
+        self.assertEqual((cfg["execution"]["session"]["start"], cfg["execution"]["session"]["end"]), ("08:30", "10:00"))
+        self.assertEqual(default_config("spec", "spec")["execution"], EXECUTION_CONFIG)
+        with self.assertRaises(ValueError):
+            default_config("unlimited")
+        with self.assertRaises(ValueError):
+            default_config(session="all_day")
+
+    def _rm(self, cfg):
+        rm = RiskManager(cfg, CostModel.default("ES"))
+        rm.new_day("2024-03-12")
+        return rm
+
+    def _trade(self, rm, pnl, level, t):
+        a = rm.approve(make_signal(t=t, level_id=level, touch=t - NS_PER_MIN), t, 540, False)
+        self.assertIsInstance(a, Approval, getattr(a, "reason", ""))
+        rm.consume(a)
+        rm.on_entry_filled(a)
+        rm.on_trade_closed(pnl, t + NS_PER_MIN)
+
+    def test_relaxed_keeps_trading_but_keeps_brakes(self):
+        rm = self._rm(default_config("relaxed"))
+        t = ns("2024-03-12 08:40")
+        self._trade(rm, +300, "L1", t)                      # a win no longer ends the day
+        self.assertIsNone(rm.day_blocked_reason())
+        self._trade(rm, -150, "L2", t + 5 * NS_PER_MIN)
+        self.assertIsNone(rm.trade_context().require_touch_after_ns)   # no A+ requirement after a loss
+        self.assertIn("L1", rm.trade_context().exclude_level_ids)      # but never re-use a traded level
+        self.assertEqual(rm.approve(make_signal(t=t, level_id="L1"), t, 540, False).reason,
+                         "KEY_LEVEL_ALREADY_TRADED")
+        for k in range(3):
+            self._trade(rm, -150, f"M{k}", t + (10 + k) * NS_PER_MIN)
+        self.assertEqual(rm.day.losses, 4)
+        self.assertEqual(rm.day_blocked_reason(), "MAX_DAILY_LOSSES")  # 4 losses -> done
+        rm.new_day("2024-03-13")
+        self.assertIsNone(rm.day_blocked_reason())
+
+    def test_relaxed_still_obeys_daily_loss_limit_and_cap(self):
+        rm = self._rm(default_config("relaxed"))
+        t = ns("2024-03-12 08:40")
+        self._trade(rm, -1000.0, "L1", t)                   # 2% of 50k in one go
+        self.assertEqual(rm.day_blocked_reason(), "DAILY_LOSS_LIMIT")
+        rm = self._rm(default_config("relaxed"))
+        for k in range(10):
+            self._trade(rm, +10.0, f"W{k}", t + k * NS_PER_MIN)
+        self.assertEqual(rm.day_blocked_reason(), "MAX_TRADES_REACHED")
+
+    def test_extended_session_window(self):
+        rm = self._rm(default_config(session="extended"))
+        t = ns("2024-03-12 14:00")
+        self.assertIsInstance(rm.approve(make_signal(t=t), t, 14 * 60 + 30, False), Approval)
+        self.assertEqual(rm.approve(make_signal(t=t, level_id="X"), t, 14 * 60 + 31, False).reason,
+                         "OUTSIDE_SESSION")
+        spec = self._rm(default_config())
+        self.assertEqual(spec.approve(make_signal(t=t), t, 10 * 60 + 1, False).reason, "OUTSIDE_SESSION")
+
+    def test_extended_session_scanner_and_flatten_guard(self):
+        from fbt.trader import AlpacaPaperBroker, PaperTrader, TradingError
+        sc = Scanner(default_config(session="extended"), ["SPY"])
+        self.assertTrue(sc.in_session(ns("2024-03-12 14:30")))
+        self.assertFalse(sc.in_session(ns("2024-03-12 14:31")))
+        keys = TestPaperTrader.KEYS
+        with self.assertRaisesRegex(TradingError, "must be after the last entry"):
+            PaperTrader(default_config(session="extended"), lambda rm: AlpacaPaperBroker(rm, http=None, env=keys),
+                        ["SPY"], state_path=None, trades_log=None, flatten_time="14:00")
+
+    def test_backtest_cli_accepts_profiles(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.csv")
+            random_walk_df(days=3, seed=2).to_csv(p, index_label="timestamp")
+            out = os.path.join(d, "out")
+            self.assertEqual(cli_main(["--data", p, "--symbol", "ES", "--out", out,
+                                       "--daily-limits", "relaxed", "--session", "extended"]), 0)
+            import glob
+            import json
+            summ = json.load(open(glob.glob(os.path.join(out, "*", "summary.json"))[0]))
+            self.assertEqual(summ["config"]["profiles"], {"daily_limits": "relaxed", "session": "extended"})
+
+
 class FakeAlpacaTrading:
     """Stand-in for Alpaca's paper Trading API. Records every call."""
 

@@ -116,11 +116,50 @@ BACKTEST_CONFIG = {
 }
 
 
-def default_config() -> dict:
-    """Deep copy of all configuration so callers can modify it safely."""
-    return {
+# ---------------------------------------------------------------------------
+# Opt-in variations (the defaults stay exactly as docs/STRATEGY.md says)
+# ---------------------------------------------------------------------------
+DAILY_LIMIT_PROFILES = {
+    # spec 4.5 as written
+    "spec": copy.deepcopy(EXECUTION_CONFIG["daily_limits"]),
+    # NOT the spec: keep trading after wins and losses. Brakes that remain: max 10 trades,
+    # stop after 4 losses, the 2% daily loss limit (RISK_CONFIG), one position at a time,
+    # never re-using a key level already traded that day.
+    "relaxed": {
+        "max_trades": 10,
+        "stop_after_one_win": False,
+        "stop_after_one_loss": False,
+        "stop_after_two_losses": False,
+        "allow_new_A_PLUS_setup": True,
+        "max_daily_losses": 4,
+    },
+}
+
+SESSION_PROFILES = {
+    "spec": {"start": "08:30", "end": "10:00"},       # spec 4.6: 9:30-11:00 ET
+    # NOT the spec: new entries until 14:30 CT (30 min before the ETF close, 20 min before
+    # the 14:50 paper-trading flatten). Untested by PB Blake's method.
+    "extended": {"start": "08:30", "end": "14:30"},
+}
+
+
+def default_config(daily_limits: str = "spec", session: str = "spec") -> dict:
+    """Deep copy of all configuration so callers can modify it safely.
+
+    `daily_limits` / `session` select a profile above; "spec" (the default) is the
+    strategy document unchanged.
+    """
+    if daily_limits not in DAILY_LIMIT_PROFILES:
+        raise ValueError(f"daily_limits must be one of {sorted(DAILY_LIMIT_PROFILES)}")
+    if session not in SESSION_PROFILES:
+        raise ValueError(f"session must be one of {sorted(SESSION_PROFILES)}")
+    cfg = {
         "execution": copy.deepcopy(EXECUTION_CONFIG),
         "strategy": copy.deepcopy(STRATEGY_CONFIG),
         "risk": copy.deepcopy(RISK_CONFIG),
         "backtest": copy.deepcopy(BACKTEST_CONFIG),
     }
+    cfg["execution"]["daily_limits"] = copy.deepcopy(DAILY_LIMIT_PROFILES[daily_limits])
+    cfg["execution"]["session"].update(SESSION_PROFILES[session])
+    cfg["profiles"] = {"daily_limits": daily_limits, "session": session}
+    return cfg

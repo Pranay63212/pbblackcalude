@@ -316,9 +316,14 @@ def main(argv=None) -> int:
     ap.add_argument("--oos-start", default=None, help="date splitting in-sample / out-of-sample stats")
     ap.add_argument("--out", default="results")
     ap.add_argument("--all-decisions", action="store_true", help="log every evaluation, not only non-WAIT")
+    ap.add_argument("--daily-limits", choices=["spec", "relaxed"], default="spec",
+                    help="spec = strategy rules (default); relaxed = keep trading after wins/losses (max 10, "
+                         "stop after 4 losses or the 2%% daily loss limit)")
+    ap.add_argument("--session", choices=["spec", "extended"], default="spec",
+                    help="spec = new entries 08:30-10:00 CT (default); extended = until 14:30 CT")
     args = ap.parse_args(argv)
 
-    cfg = default_config()
+    cfg = default_config(args.daily_limits, args.session)
     try:
         df = load_ohlcv(args.data, symbol=args.data_symbol, tz=args.tz, start=args.start, end=args.end)
         data = MultiTimeframeData(df, args.symbol, daily_history=load_daily(args.daily_data))

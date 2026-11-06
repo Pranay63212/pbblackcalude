@@ -175,6 +175,9 @@ class PaperTrader:
         self.state_path = state_path
         self.trades_log = trades_log
         self.flatten = parse_hhmm(flatten_time)
+        if self.flatten <= parse_hhmm(config["execution"]["session"]["end"]):
+            raise TradingError(f"flatten time {flatten_time} must be after the last entry time "
+                               f"{config['execution']['session']['end']} CT.")
         self.open: Optional[OpenTrade] = None
         self._synced_day = None
         self._first_sync = True

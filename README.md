@@ -248,6 +248,18 @@ Alpaca (good-till-cancelled), so the stop stays in place even if this computer t
 - Order code lives only in `fbt/trader.py`; the scanner module itself never places orders.
 - Tested against a stand-in for Alpaca's API, not yet against Alpaca's servers.
 
+## Opt-in variations (not the strategy document)
+
+Both `fbt.backtest` and `fbt.scanner` accept:
+
+| Flag | Default (`spec`) | Alternative |
+|---|---|---|
+| `--daily-limits` | spec 4.5: stop after a win; after a loss only a new A+ setup; max 2 trades | `relaxed`: keep trading after wins and losses, up to 10 trades; stops after 4 losses or the 2% daily loss limit; one position at a time; a key level is never traded twice in a day |
+| `--session` | spec 4.6: new entries 08:30-10:00 CT | `extended`: new entries until 14:30 CT (open trades are still flattened at 14:50 CT for ETFs, 15:50 CT in backtests) |
+
+Without flags, everything follows docs/STRATEGY.md. Each run records its profiles in
+`summary.json`.
+
 ## Free real-data backtest (Yahoo Finance)
 
 ```bash

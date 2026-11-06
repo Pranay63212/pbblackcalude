@@ -283,6 +283,20 @@ def format_stats(stats: dict, title: str = "ALL TRADES") -> str:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def load_daily(path: Optional[str]) -> Optional[pd.DataFrame]:
+    """Daily bars CSV indexed by trading date (as written by fbt.yahoo)."""
+    if not path:
+        return None
+    if not os.path.exists(path):
+        raise DataError(f"Daily data file not found: {path}")
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+    except Exception as exc:
+        raise DataError(f"Could not parse daily data {path}: {exc}") from exc
+    df.columns = [str(c).lower() for c in df.columns]
+    return df
+
+
 def main(argv=None) -> int:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from config import default_config
@@ -293,6 +307,9 @@ def main(argv=None) -> int:
     ap.add_argument("--data-symbol", default=None, help="value of the file's 'symbol' column to select")
     ap.add_argument("--smt-data", default=None, help="optional second instrument for SMT (e.g. NQ when trading ES)")
     ap.add_argument("--smt-symbol", default=None)
+    ap.add_argument("--daily-data", default=None, help="optional daily bars (date,open,high,low,close,volume) "
+                    "for warm-up when the 1-minute file is short, e.g. from python -m fbt.yahoo")
+    ap.add_argument("--smt-daily-data", default=None)
     ap.add_argument("--tz", default="UTC", help="timezone of naive timestamps in the file")
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
@@ -304,11 +321,11 @@ def main(argv=None) -> int:
     cfg = default_config()
     try:
         df = load_ohlcv(args.data, symbol=args.data_symbol, tz=args.tz, start=args.start, end=args.end)
-        data = MultiTimeframeData(df, args.symbol)
+        data = MultiTimeframeData(df, args.symbol, daily_history=load_daily(args.daily_data))
         smt = None
         if args.smt_data:
             sdf = load_ohlcv(args.smt_data, tz=args.tz, start=args.start, end=args.end)
-            smt = MultiTimeframeData(sdf, args.smt_symbol or "NQ")
+            smt = MultiTimeframeData(sdf, args.smt_symbol or "NQ", daily_history=load_daily(args.smt_daily_data))
     except DataError as exc:
         print(f"DATA ERROR: {exc}", file=sys.stderr)
         return 2

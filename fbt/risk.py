@@ -120,7 +120,8 @@ class RiskManager:
         if per_contract <= 0:
             return 0
         n = math.floor(risk_dollars / per_contract)
-        return int(max(0, min(n, self.risk["max_contracts"])))
+        cap = self.inst.max_units if self.inst.max_units is not None else self.risk["max_contracts"]
+        return int(max(0, min(n, cap)))
 
     def approve(self, signal: Signal, now_ns: int, local_minute: int, has_position: bool):
         if has_position or self.position_open:
@@ -141,7 +142,8 @@ class RiskManager:
         if (bull and signal.target <= signal.entry_price) or (not bull and signal.target >= signal.entry_price):
             return Rejection("TARGET_ON_WRONG_SIDE")
         stop_ticks = abs(signal.entry_price - signal.stop) / self.inst.tick_size
-        if stop_ticks + 1e-9 < self.risk["min_stop_ticks"]:
+        min_ticks = self.inst.min_stop_ticks if self.inst.min_stop_ticks is not None else self.risk["min_stop_ticks"]
+        if stop_ticks + 1e-9 < min_ticks:
             return Rejection("STOP_TOO_TIGHT")
         contracts = self.size(signal)
         if contracts < 1:

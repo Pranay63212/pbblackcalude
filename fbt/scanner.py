@@ -13,6 +13,7 @@ not know your fills, so it cannot enforce the daily limits (spec 4.5); it
 prints them as a reminder.
 
 Usage:
+  python -m fbt.scanner live --feed alpaca                      (SPY QQQ DIA GLD, free data)
   python -m fbt.scanner live --feed ibkr --symbols ES NQ YM GC [--port 7497]
   python -m fbt.scanner live --feed csv --folder data/live --symbols ES NQ
   python -m fbt.scanner replay --data data/ES_1m.csv.gz --symbol ES --date 2024-03-12
@@ -33,7 +34,7 @@ from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 
-from .costs import SMT_PAIRS, CostModel, get_instrument
+from .costs import ETFS, SMT_PAIRS, CostModel, get_instrument
 from .data import CHICAGO, DataError, MultiTimeframeData, load_ohlcv, ns_to_chicago, parse_hhmm
 from .feeds import completed_only, merge_bars, minutes_since_last_bar
 from .risk import RiskManager
@@ -95,7 +96,8 @@ def sizing_lines(signal, symbol: str, config: dict) -> List[str]:
         inst = get_instrument(sym)
         rm = RiskManager(config, CostModel.default(sym))
         per = abs(signal.entry_price - signal.stop) * inst.point_value
-        lines.append(f"{sym}: ${per:,.2f} risk per contract, {rm.size(signal)} contract(s) at "
+        unit = inst.unit
+        lines.append(f"{sym}: ${per:,.2f} risk per {unit}, {rm.size(signal)} {unit}(s) at "
                      f"{config['risk']['risk_per_trade_pct']}% of ${config['risk']['initial_equity']:,.0f}")
     return lines
 
@@ -329,8 +331,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="PB Blake strategy scanner (alerts only, never trades)")
     sub = ap.add_subparsers(dest="mode", required=True)
     lv = sub.add_parser("live")
-    lv.add_argument("--feed", choices=["ibkr", "csv"], required=True)
-    lv.add_argument("--symbols", nargs="+", default=["ES", "NQ", "YM", "GC"])
+    lv.add_argument("--feed", choices=["alpaca", "ibkr", "csv"], required=True)
+    lv.add_argument("--symbols", nargs="+", default=None,
+                    help="default: SPY QQQ DIA GLD for alpaca, ES NQ YM GC otherwise")
+    lv.add_argument("--stale-minutes", type=float, default=None,
+                    help="minutes without a new bar before a symbol is flagged (default 5 alpaca, 3 otherwise)")
     lv.add_argument("--folder", default="data/live", help="csv feed: folder with <SYMBOL>.csv files")
     lv.add_argument("--tz", default="UTC")
     lv.add_argument("--host", default="127.0.0.1")
@@ -364,18 +369,24 @@ def main(argv=None) -> int:
         print(DISCLAIMER)
         return 0
 
-    from .feeds import CSVFolderFeed, IBKRFeed
+    from .feeds import AlpacaFeed, CSVFolderFeed, IBKRFeed
+    symbols = args.symbols or (list(ETFS) if args.feed == "alpaca" else ["ES", "NQ", "YM", "GC"])
+    stale = args.stale_minutes or (5.0 if args.feed == "alpaca" else 3.0)
     try:
-        feed = CSVFolderFeed(args.folder, args.tz) if args.feed == "csv" else \
-            IBKRFeed(args.host, args.port, args.client_id)
+        if args.feed == "csv":
+            feed = CSVFolderFeed(args.folder, args.tz)
+        elif args.feed == "alpaca":
+            feed = AlpacaFeed()
+        else:
+            feed = IBKRFeed(args.host, args.port, args.client_id)
     except DataError as exc:
         print(f"DATA ERROR: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:  # e.g. TWS not running
         print(f"Could not connect to the data feed: {exc}", file=sys.stderr)
         return 3
-    runner = LiveRunner(Scanner(cfg, args.symbols), feed, AlertSink(log_path=args.log),
-                        history_days=args.history_days)
+    runner = LiveRunner(Scanner(cfg, symbols), feed, AlertSink(log_path=args.log),
+                        history_days=args.history_days, stale_minutes=stale)
     print(f"Scanning {', '.join(runner.scanner.symbols)}; signals only {cfg['execution']['session']['start']}-"
           f"{cfg['execution']['session']['end']} CT. Ctrl+C to stop.")
     try:

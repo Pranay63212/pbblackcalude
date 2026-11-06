@@ -4,3 +4,5 @@ pandas>=2.1
 # databento>=0.40
 # optional, only for the live scanner's Interactive Brokers feed:
 # ib_async>=2.0
+# optional, only for free Yahoo Finance history (python -m fbt.yahoo):
+# yfinance>=0.2.40

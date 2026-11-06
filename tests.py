@@ -1270,5 +1270,114 @@ class TestFeeds(unittest.TestCase):
         self.assertEqual(get_instrument("MYM").point_value, 0.5)
 
 
+class TestAlpacaYahooETF(unittest.TestCase):
+    ENV = {"APCA_API_KEY_ID": "test-id-not-real", "APCA_API_SECRET_KEY": "test-secret-not-real"}
+
+    def test_alpaca_requires_env_keys_and_hides_them(self):
+        from fbt.feeds import AlpacaFeed
+        with self.assertRaisesRegex(DataError, "APCA_API_KEY_ID"):
+            AlpacaFeed(env={})
+        f = AlpacaFeed(env=self.ENV, http=lambda u, h: {"bars": []})
+        self.assertNotIn("test-secret", repr(f))
+        self.assertNotIn("test-id", repr(f))
+
+    def test_alpaca_pagination_headers_and_conversion(self):
+        from fbt.feeds import AlpacaFeed
+        calls = []
+        pages = [{"bars": [{"t": "2026-11-06T14:30:00Z", "o": 1, "h": 2, "l": .5, "c": 1.5, "v": 10}],
+                  "next_page_token": "abc"},
+                 {"bars": [{"t": "2026-11-06T14:31:00Z", "o": 1.5, "h": 2, "l": 1, "c": 1.75, "v": 5}],
+                  "next_page_token": None}]
+
+        def http(url, headers):
+            calls.append((url, headers))
+            return pages[len(calls) - 1]
+        f = AlpacaFeed(env=self.ENV, http=http)
+        df = f.history("SPY", 1)
+        self.assertEqual(len(df), 2)
+        self.assertEqual(str(df.index.tz), "UTC")
+        self.assertIn("feed=iex", calls[0][0])
+        self.assertIn("page_token=abc", calls[1][0])
+        self.assertEqual(calls[0][1]["APCA-API-KEY-ID"], "test-id-not-real")
+        self.assertNotIn("test-secret-not-real", calls[0][0])  # secret only in headers, never in the URL
+
+    def test_alpaca_daily_excludes_today(self):
+        from fbt.feeds import AlpacaFeed, current_trading_date
+        today = current_trading_date(pd.Timestamp.now(tz="UTC"))
+        y = pd.Timestamp(today) - pd.Timedelta(days=1)
+        bars = [{"t": (pd.Timestamp(d).tz_localize("America/New_York")).tz_convert("UTC").isoformat(),
+                 "o": 1, "h": 2, "l": .5, "c": 1.5, "v": 1} for d in (y, pd.Timestamp(today))]
+        f = AlpacaFeed(env=self.ENV, http=lambda u, h: {"bars": bars})
+        d = f.daily_history("SPY")
+        self.assertEqual(list(d.index.date), [y.date()])
+
+    def test_yahoo_rounding_forming_bar_and_daily(self):
+        from fbt import yahoo
+        now = pd.Timestamp("2026-11-06 18:40:30", tz="UTC")
+        idx = pd.date_range("2026-11-06 18:37", periods=4, freq="1min", tz="UTC")
+        m1 = pd.DataFrame({"Open": np.float32([3969.9, 3970.0, 3970.1, 3970.2]).astype(float),
+                           "High": np.float32([3970.0, 3970.1, 3970.2, 3970.3]).astype(float),
+                           "Low": np.float32([3969.8, 3969.9, 3970.0, 3970.1]).astype(float),
+                           "Close": np.float32([3970.0, 3970.1, 3970.2, 3970.3]).astype(float),
+                           "Adj Close": 0.0, "Volume": 1.0}, index=idx)
+        daily = pd.DataFrame({"Open": [1.0, 1.0], "High": [2.0, 2.0], "Low": [.5, .5], "Close": [1.5, 1.5],
+                              "Volume": [1.0, 1.0]}, index=pd.to_datetime(["2026-11-05", "2026-11-06"]))
+
+        class FakeYF:
+            @staticmethod
+            def download(ticker, **kw):
+                return m1 if kw.get("interval") == "1m" else daily
+        orig = yahoo._yf
+        yahoo._yf = lambda: FakeYF
+        try:
+            df = yahoo.download_1m("GC", days=1, now=now, pause=0)
+            self.assertEqual(len(df), 3)                       # 18:40 bar still forming -> dropped
+            self.assertEqual(df["open"].iloc[0], 3969.9)       # float32 noise removed, exact tick
+            d = yahoo.download_daily("GC", now=now)
+            # 12:40 CT on Nov 6: the Nov 6 session is still trading -> only Nov 5 is a finished daily bar
+            self.assertEqual(list(d.index.date), [pd.Timestamp("2026-11-05").date()])
+            big = m1.copy()
+            big[["Open", "High", "Low", "Close"]] = 70_000.0
+            with self.assertRaises(DataError):
+                yahoo._normalise(big, "X")
+        finally:
+            yahoo._yf = orig
+
+    def test_etf_specs_sizing_and_costs(self):
+        spy = get_instrument("SPY")
+        self.assertEqual((spy.unit, spy.point_value, spy.max_units, spy.min_stop_ticks), ("share", 1.0, 2000, 10))
+        self.assertGreaterEqual(costs_mod.DEFAULT_COMMISSION_PER_SIDE["SPY"], 0.005)
+        cfg = default_config()
+        rm = RiskManager(cfg, CostModel.default("SPY"))
+        rm.new_day("2026-11-06")
+        t = ns("2026-11-06 09:00")
+        # 250$ risk / (0.50 stop + 0.01 commission + 0.02 slippage) = 471 shares
+        self.assertEqual(rm.size(make_signal(entry=500.0, stop=499.5, target=501.0, t=t)), 471)
+        rm.equity = 10_000_000
+        self.assertEqual(rm.size(make_signal(entry=500.0, stop=499.5, target=501.0, t=t)), 2000)
+        r = rm.approve(make_signal(entry=500.0, stop=499.95, target=501.0, t=t), t, 540, False)
+        self.assertEqual(r.reason, "STOP_TOO_TIGHT")              # 5 cents < 10-tick minimum
+        self.assertEqual(costs_mod.SMT_PAIRS["SPY"], "QQQ")
+
+    def test_daily_data_loading_errors(self):
+        from fbt.backtest import load_daily
+        self.assertIsNone(load_daily(None))
+        with self.assertRaisesRegex(DataError, "not found"):
+            load_daily("/nonexistent/daily.csv")
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.csv")
+            random_walk_df(days=3, seed=2).to_csv(p, index_label="timestamp")
+            code = cli_main(["--data", p, "--daily-data", os.path.join(d, "nope.csv"), "--symbol", "ES",
+                             "--out", os.path.join(d, "out")])
+            self.assertEqual(code, 2)
+
+    def test_scanner_alpaca_without_keys_exits_cleanly(self):
+        saved = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("APCA_")}
+        try:
+            self.assertEqual(scanner_mod.main(["live", "--feed", "alpaca"]), 2)
+        finally:
+            os.environ.update(saved)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

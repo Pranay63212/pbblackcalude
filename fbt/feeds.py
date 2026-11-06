@@ -10,6 +10,8 @@ Feeds:
   by your charting platform's exporter. Fully tested.
 * ReplayFeed: serves a historical frame as if it were arriving live (tests,
   rehearsals). Fully tested.
+* AlpacaFeed: Alpaca's free IEX stock/ETF data (SPY, QQQ, DIA, GLD), keys
+  from environment variables. Tested with a fake HTTP client only.
 * IBKRFeed: Interactive Brokers TWS / IB Gateway via `ib_async`, opened
   read-only. Its conversions are unit-tested with a fake client, but it has
   NOT been run against a real TWS session from this project's test suite.
@@ -210,11 +212,108 @@ class IBKRFeed:
         return ib_bars_to_frame(bars)
 
 
+# ---------------------------------------------------------------------------
+# Alpaca market data (read-only, free IEX feed)
+# ---------------------------------------------------------------------------
+class AlpacaFeed:
+    """Alpaca stock/ETF bars from data.alpaca.markets. Keys come ONLY from the environment
+    variables APCA_API_KEY_ID and APCA_API_SECRET_KEY; they are never logged or stored.
+
+    The free plan's real-time feed is IEX (a single exchange): prices track the full
+    market closely, but some minutes have no IEX trade, so expect occasional gaps.
+    This class only reads market data; it has no order methods.
+    """
+
+    BASE = "https://data.alpaca.markets/v2/stocks"
+
+    def __init__(self, feed: str = "iex", http=None, env=None):
+        env = os.environ if env is None else env
+        self._key = env.get("APCA_API_KEY_ID")
+        self._secret = env.get("APCA_API_SECRET_KEY")
+        if not self._key or not self._secret:
+            raise DataError("Set the APCA_API_KEY_ID and APCA_API_SECRET_KEY environment variables "
+                            "(Alpaca dashboard -> API Keys). Never put them in a file in this project.")
+        self.feed = feed
+        self._http = http or self._urllib_get
+
+    def __repr__(self) -> str:  # never show keys
+        return f"AlpacaFeed(feed={self.feed!r}, keys=<hidden>)"
+
+    def _urllib_get(self, url: str, headers: dict) -> dict:
+        import json
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise DataError("Alpaca rejected the API keys (check APCA_API_KEY_ID / APCA_API_SECRET_KEY, "
+                                "and that they are the paper-account keys).") from None
+            raise DataError(f"Alpaca data request failed: HTTP {exc.code}") from None
+        except urllib.error.URLError as exc:
+            raise DataError(f"Could not reach Alpaca: {exc.reason}") from None
+
+    def _bars(self, symbol: str, timeframe: str, start: pd.Timestamp, end: pd.Timestamp) -> list:
+        from urllib.parse import urlencode
+        headers = {"APCA-API-KEY-ID": self._key, "APCA-API-SECRET-KEY": self._secret}
+        params = {"timeframe": timeframe, "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"), "limit": 10000, "feed": self.feed,
+                  "adjustment": "raw", "sort": "asc"}
+        out, token = [], None
+        for _ in range(200):
+            q = dict(params, **({"page_token": token} if token else {}))
+            data = self._http(f"{self.BASE}/{symbol}/bars?{urlencode(q)}", headers)
+            out.extend(data.get("bars") or [])
+            token = data.get("next_page_token")
+            if not token:
+                break
+        return out
+
+    @staticmethod
+    def bars_to_frame(bars: list) -> pd.DataFrame:
+        rows = [(pd.Timestamp(b["t"]), float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"]),
+                 max(float(b.get("v", 0)), 0.0)) for b in bars]
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"]).set_index("timestamp")
+        if len(df):
+            idx = pd.DatetimeIndex(df.index)
+            idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+            df.index = idx.as_unit("ns")
+            df = df[~df.index.duplicated(keep="last")].sort_index()
+        return df
+
+    def history(self, symbol: str, days: int) -> pd.DataFrame:
+        now = pd.Timestamp.now(tz="UTC")
+        df = self.bars_to_frame(self._bars(symbol, "1Min", now - pd.Timedelta(days=days), now))
+        if len(df) == 0:
+            raise DataError(f"Alpaca returned no 1-minute history for {symbol}")
+        validate_ohlcv(df, source=f"Alpaca {symbol}")
+        return df
+
+    def daily_history(self, symbol: str) -> Optional[pd.DataFrame]:
+        now = pd.Timestamp.now(tz="UTC")
+        bars = self._bars(symbol, "1Day", now - pd.Timedelta(days=400), now)
+        rows = []
+        today = current_trading_date(now)
+        for b in bars:
+            d = pd.Timestamp(b["t"]).tz_convert("America/New_York").tz_localize(None).normalize()
+            if d.date() >= today:
+                continue  # today's session is unfinished
+            rows.append((d, float(b["o"]), float(b["h"]), float(b["l"]), float(b["c"]), max(float(b.get("v", 0)), 0.0)))
+        df = pd.DataFrame(rows, columns=["date", "open", "high", "low", "close", "volume"]).set_index("date")
+        return df if len(df) else None
+
+    def recent(self, symbol: str) -> pd.DataFrame:
+        now = pd.Timestamp.now(tz="UTC")
+        return self.bars_to_frame(self._bars(symbol, "1Min", now - pd.Timedelta(minutes=30), now))
+
+
 def minutes_since_last_bar(df: pd.DataFrame, now_utc: pd.Timestamp) -> float:
     if df is None or len(df) == 0:
         return float("inf")
     return (now_utc - (df.index[-1] + pd.Timedelta(minutes=1))) / pd.Timedelta(minutes=1)
 
 
-__all__ = ["completed_only", "merge_bars", "ReplayFeed", "CSVFolderFeed", "IBKRFeed", "ib_bars_to_frame",
+__all__ = ["completed_only", "merge_bars", "ReplayFeed", "CSVFolderFeed", "IBKRFeed", "AlpacaFeed", "ib_bars_to_frame",
            "ib_daily_to_frame", "current_trading_date", "minutes_since_last_bar"]

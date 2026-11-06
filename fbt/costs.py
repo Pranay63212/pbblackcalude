@@ -11,6 +11,7 @@ to make results look better.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Defaults (do not lower)
@@ -24,6 +25,12 @@ DEFAULT_COMMISSION_PER_SIDE = {
     "MYM": 0.85,
     "GC": 2.50,
     "MGC": 0.85,
+    # ETF stand-ins (per SHARE per side). Alpaca charges no commission, but sell-side
+    # regulatory fees exist; this conservative allowance covers them.
+    "SPY": 0.005,
+    "QQQ": 0.005,
+    "DIA": 0.005,
+    "GLD": 0.005,
 }
 # Slippage in ticks applied to every market order and every stop order fill.
 DEFAULT_MARKET_SLIPPAGE_TICKS = 1
@@ -37,7 +44,10 @@ DEFAULT_LIMIT_SLIPPAGE_TICKS = 0
 class InstrumentSpec:
     symbol: str
     tick_size: float
-    tick_value: float  # dollars per tick per contract
+    tick_value: float  # dollars per tick per contract (or per share)
+    unit: str = "contract"
+    max_units: Optional[int] = None       # overrides RISK_CONFIG max_contracts (e.g. shares)
+    min_stop_ticks: Optional[int] = None  # overrides RISK_CONFIG min_stop_ticks
 
     @property
     def point_value(self) -> float:
@@ -56,6 +66,12 @@ INSTRUMENTS = {
     "MYM": InstrumentSpec("MYM", 1.0, 0.50),    # Micro E-mini Dow
     "GC": InstrumentSpec("GC", 0.10, 10.00),    # COMEX gold
     "MGC": InstrumentSpec("MGC", 0.10, 1.00),   # Micro gold
+    # ETF stand-ins for paper alerts on free data (not the futures the spec targets).
+    # 10-cent minimum stop ~ one ES point on SPY.
+    "SPY": InstrumentSpec("SPY", 0.01, 0.01, "share", 2000, 10),
+    "QQQ": InstrumentSpec("QQQ", 0.01, 0.01, "share", 2000, 10),
+    "DIA": InstrumentSpec("DIA", 0.01, 0.01, "share", 2000, 10),
+    "GLD": InstrumentSpec("GLD", 0.01, 0.01, "share", 2000, 10),
 }
 
 # Exchange of each root (used by live data adapters).
@@ -63,7 +79,8 @@ EXCHANGES = {"ES": "CME", "MES": "CME", "NQ": "CME", "MNQ": "CME",
              "YM": "CBOT", "MYM": "CBOT", "GC": "COMEX", "MGC": "COMEX"}
 
 # Spec 1.4 compares ES and NQ. Micros pair with micros.
-SMT_PAIRS = {"ES": "NQ", "NQ": "ES", "MES": "MNQ", "MNQ": "MES"}
+SMT_PAIRS = {"ES": "NQ", "NQ": "ES", "MES": "MNQ", "MNQ": "MES", "SPY": "QQQ", "QQQ": "SPY"}
+ETFS = ("SPY", "QQQ", "DIA", "GLD")
 
 
 def get_instrument(symbol: str) -> InstrumentSpec:

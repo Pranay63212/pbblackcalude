@@ -196,6 +196,7 @@ The scanner cannot see your fills, so the daily limits (spec 4.5) are printed as
 reminder rather than enforced. It contains no order code (a test checks this).
 
 ```bash
+python -m fbt.scanner live --feed alpaca                         # free: SPY QQQ DIA GLD (stand-ins)
 python -m fbt.scanner live --feed ibkr --symbols ES NQ YM GC      # TWS paper on port 7497
 python -m fbt.scanner live --feed ibkr --port 4002               # IB Gateway paper
 python -m fbt.scanner live --feed csv --folder data/live         # <SYMBOL>.csv files kept up to date
@@ -207,10 +208,30 @@ python -m fbt.scanner replay --data data/ES_1m.csv.gz --symbol ES --date 2024-03
   for CME, CBOT and COMEX; without it IB sends delayed data or none. The connection is
   read-only. On first start it loads 20 days of 1-minute bars plus a year of daily bars,
   which takes a few minutes. The front-month contract is used, so expect oddities around rolls.
+- **Alpaca (free):** set the environment variables `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`
+  to your paper-account keys (Windows: `setx APCA_API_KEY_ID "..."`, then open a new window).
+  The free IEX feed covers one exchange, so quiet minutes can be missing; the scanner waits
+  5 minutes before flagging stale data. SPY/QQQ/DIA/GLD track ES/NQ/YM/GC but are stand-ins,
+  sized in shares (max 2,000, minimum stop 10 cents).
 - **Phone alerts:** set the environment variable `FBT_ALERT_WEBHOOK` to an ntfy.sh topic URL
   or a Discord webhook. Never put it in a file in this repository.
 - Alerts are also logged to `results/alerts.csv`.
 - `replay` rehearses a past day through the same code, to check alerts against a chart.
+
+## Free real-data backtest (Yahoo Finance)
+
+```bash
+pip install yfinance
+python -m fbt.yahoo --symbols ES NQ YM GC --out data/yahoo
+python -m fbt.backtest --data data/yahoo/ES_1m.csv.gz --daily-data data/yahoo/ES_daily.csv.gz --symbol MES
+```
+
+Yahoo provides about 30 days of 1-minute bars plus daily bars, which supply the 60-day
+daily-bias history. The series are continuous front-month futures, not back-adjusted.
+Prices are rounded to 2 decimals to remove Yahoo's float32 storage noise (exact for every
+supported tick). One year of daily bars is fetched because older Yahoo YM history contains
+malformed candles, which the loader rejects. About two weeks of each month go to warm-up, so
+expect only a handful of trades: useful for checking behaviour, not for judging the strategy.
 
 ## Known limitations
 

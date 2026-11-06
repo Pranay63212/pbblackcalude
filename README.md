@@ -1,5 +1,7 @@
 # fbt: futures backtester for ES/NQ 1-minute bars
 
+claude pb black strat
+
 An event-driven research backtester for the PB Blake ICT-style strategy described in
 [`docs/STRATEGY.md`](docs/STRATEGY.md), which is the source of truth. Rules for
 contributors and agents are in [`AGENTS.md`](AGENTS.md).

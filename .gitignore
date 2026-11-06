@@ -1,0 +1,6 @@
+data/
+results/
+*.csv.gz
+*.dbn.zst
+.env
+__pycache__/

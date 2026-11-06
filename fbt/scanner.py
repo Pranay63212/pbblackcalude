@@ -170,6 +170,12 @@ class Scanner:
         self._premarket_done: Dict[str, object] = {}
         self._alerted: set = set()
 
+    def active(self, now_ns: int) -> bool:
+        """Minutes when the scanner does work: 5 minutes before the session through its end."""
+        t = ns_to_chicago(now_ns)
+        m = t.hour * 60 + t.minute
+        return self.start - 5 <= m <= self.end
+
     def in_session(self, now_ns: int) -> bool:
         t = ns_to_chicago(now_ns)
         m = t.hour * 60 + t.minute
@@ -212,8 +218,12 @@ class Scanner:
 # alert sinks
 # ---------------------------------------------------------------------------
 class AlertSink:
+    PUSH_KINDS = ("SIGNAL", "SETUP_FORMING", "STALE", "DATA_ERROR")
+
     def __init__(self, log_path: Optional[str] = None, webhook: Optional[str] = None,
-                 send: Optional[Callable[[str, str], None]] = None, echo: Callable[[str], None] = print):
+                 send: Optional[Callable[[str, str], None]] = None, echo: Callable[[str], None] = print,
+                 push_summary: bool = False):
+        self.push_kinds = self.PUSH_KINDS + (("PREMARKET", "HEARTBEAT") if push_summary else ())
         self.log_path = log_path
         self.webhook = webhook if webhook is not None else os.environ.get("FBT_ALERT_WEBHOOK")
         self.send = send or _post_webhook
@@ -227,7 +237,7 @@ class AlertSink:
             row = pd.DataFrame([{"time_ct": str(ns_to_chicago(ev.time)), "symbol": ev.symbol, "kind": ev.kind,
                                  "text": ev.text.replace("\n", " | ")}])
             row.to_csv(self.log_path, mode="a", header=new, index=False)
-        if self.webhook and ev.kind in ("SIGNAL", "SETUP_FORMING", "STALE", "DATA_ERROR"):
+        if self.webhook and ev.kind in self.push_kinds:
             try:
                 self.send(self.webhook, ev.text)
             except Exception as exc:  # an alert failure must not stop the scanner
@@ -261,15 +271,31 @@ class LiveRunner:
         self.store: Dict[str, pd.DataFrame] = {}
         self.daily: Dict[str, Optional[pd.DataFrame]] = {}
         self._stale_flag: Dict[str, bool] = {}
+        self._warmed: set = set()
+
+    def _warm_symbol(self, sym: str, now: pd.Timestamp) -> bool:
+        """Load history for one symbol. Retried each minute until it succeeds."""
+        try:
+            hist = completed_only(self.feed.history(sym, self.history_days), now)
+            self.daily[sym] = self.feed.daily_history(sym)
+            self.store[sym] = merge_bars(hist, self.store.get(sym)) if sym in self.store else hist
+            self._warmed.add(sym)
+            return True
+        except Exception as exc:  # unattended: report, retry next minute, never crash
+            self.sink.emit(ScanEvent(int(now.value), sym, "DATA_ERROR",
+                                     f"{sym} DATA ERROR loading history (will retry): {_describe(exc)}"))
+            return False
 
     def warm_up(self) -> None:
         now = self.clock()
         for sym in self.scanner.symbols:
-            try:
-                self.store[sym] = completed_only(self.feed.history(sym, self.history_days), now)
-                self.daily[sym] = self.feed.daily_history(sym)
-            except DataError as exc:
-                self.sink.emit(ScanEvent(int(now.value), sym, "DATA_ERROR", f"{sym} DATA ERROR: {exc}"))
+            self._warm_symbol(sym, now)
+
+    def _trim(self, sym: str, now: pd.Timestamp) -> None:
+        keep_from = now - pd.Timedelta(days=self.history_days + 10)
+        df = self.store.get(sym)
+        if df is not None and len(df) and df.index[0] < keep_from:
+            self.store[sym] = df[df.index >= keep_from]
 
     def step(self) -> List[ScanEvent]:
         now = self.clock()
@@ -278,7 +304,12 @@ class LiveRunner:
         now_ns = int(now.floor("min").value)
         data: Dict[str, MultiTimeframeData] = {}
         events: List[ScanEvent] = []
+        active = self.scanner.active(now_ns)
         for sym in self.scanner.symbols:
+            if sym not in self._warmed and not self._warm_symbol(sym, now):
+                continue
+            if not active:
+                continue  # nights and weekends: nothing to scan, keep quiet
             try:
                 new = completed_only(self.feed.recent(sym), now)
                 self.store[sym] = merge_bars(self.store.get(sym), new)
@@ -291,10 +322,14 @@ class LiveRunner:
                     self._stale_flag[sym] = True
                     continue
                 self._stale_flag[sym] = False
+                self._trim(sym, now)
                 data[sym] = MultiTimeframeData(self.store[sym], sym, daily_history=self.daily.get(sym))
-            except DataError as exc:
-                events.append(ScanEvent(now_ns, sym, "DATA_ERROR", f"{sym} DATA ERROR: {exc}"))
-        events += self.scanner.scan(data, now_ns)
+            except Exception as exc:  # unattended: report and keep running
+                events.append(ScanEvent(now_ns, sym, "DATA_ERROR", f"{sym} DATA ERROR: {_describe(exc)}"))
+        try:
+            events += self.scanner.scan(data, now_ns)
+        except Exception as exc:
+            events.append(ScanEvent(now_ns, "-", "DATA_ERROR", f"Scanner error (still running): {_describe(exc)}"))
         for ev in events:
             self.sink.emit(ev)
         return events
@@ -306,7 +341,14 @@ class LiveRunner:
             now = pd.Timestamp.now(tz="UTC")
             nxt = now.floor("min") + pd.Timedelta(minutes=1, seconds=delay_after_close)
             time.sleep(max(0.0, (nxt - now).total_seconds()))
-            self.step()
+            try:
+                self.step()
+            except Exception as exc:  # last line of defence: never let one bad minute stop the scanner
+                print(f"Unexpected error (still running): {_describe(exc)}")
+
+
+def _describe(exc: Exception) -> str:
+    return str(exc) if isinstance(exc, DataError) else f"{type(exc).__name__}: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +385,8 @@ def main(argv=None) -> int:
     lv.add_argument("--client-id", type=int, default=17)
     lv.add_argument("--history-days", type=int, default=20)
     lv.add_argument("--log", default="results/alerts.csv")
+    lv.add_argument("--push-summary", action="store_true",
+                    help="also send the 08:25 CT pre-session summary to your phone (daily 'still running' check)")
     rp = sub.add_parser("replay")
     rp.add_argument("--data", required=True)
     rp.add_argument("--symbol", required=True)
@@ -385,7 +429,7 @@ def main(argv=None) -> int:
     except Exception as exc:  # e.g. TWS not running
         print(f"Could not connect to the data feed: {exc}", file=sys.stderr)
         return 3
-    runner = LiveRunner(Scanner(cfg, symbols), feed, AlertSink(log_path=args.log),
+    runner = LiveRunner(Scanner(cfg, symbols), feed, AlertSink(log_path=args.log, push_summary=args.push_summary),
                         history_days=args.history_days, stale_minutes=stale)
     print(f"Scanning {', '.join(runner.scanner.symbols)}; signals only {cfg['execution']['session']['start']}-"
           f"{cfg['execution']['session']['end']} CT. Ctrl+C to stop.")

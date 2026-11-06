@@ -1270,6 +1270,84 @@ class TestFeeds(unittest.TestCase):
         self.assertEqual(get_instrument("MYM").point_value, 0.5)
 
 
+class TestUnattendedRunning(unittest.TestCase):
+    """The scanner runs for days with nobody watching: it must report problems and keep going."""
+
+    def setUp(self):
+        self.df = bullish_scenario_df()
+        self.cfg = scenario_config()
+        self.out = []
+
+    def _runner(self, feed, box):
+        sink = AlertSink(webhook="", echo=lambda t: None)
+        sink.emit = lambda ev: self.out.append(ev)
+        return LiveRunner(_fixed_scanner(self.cfg), feed, sink, clock=lambda: box[0])
+
+    def test_unexpected_feed_errors_are_reported_and_recovered(self):
+        feed = ReplayFeed({"ES": self.df})
+        box = [ct("2024-03-12 08:40:03").tz_convert("UTC")]
+        feed.now = box[0]
+        runner = self._runner(feed, box)
+        runner.warm_up()
+        real_recent = feed.recent
+        feed.recent = lambda sym: (_ for _ in ()).throw(TimeoutError("read timed out"))
+        runner.step()  # must not raise
+        self.assertTrue(any(e.kind == "DATA_ERROR" and "TimeoutError" in e.text for e in self.out))
+        feed.recent = real_recent
+        box[0] += pd.Timedelta(minutes=1)
+        feed.now = box[0]
+        self.out.clear()
+        runner.step()
+        self.assertFalse(any(e.kind == "DATA_ERROR" for e in self.out))
+
+    def test_failed_warm_up_is_retried(self):
+        feed = ReplayFeed({"ES": self.df})
+        box = [ct("2024-03-12 08:40:03").tz_convert("UTC")]
+        feed.now = box[0]
+        real_history = feed.history
+        feed.history = lambda sym, days: (_ for _ in ()).throw(ConnectionResetError("network down"))
+        runner = self._runner(feed, box)
+        runner.warm_up()
+        self.assertIn("will retry", self.out[-1].text)
+        feed.history = real_history
+        runner.step()
+        self.assertIn("ES", runner._warmed)
+        self.assertGreater(len(runner.store["ES"]), 500)
+
+    def test_quiet_outside_active_hours(self):
+        feed = ReplayFeed({"ES": self.df})
+        calls = []
+        real = feed.recent
+        feed.recent = lambda sym: calls.append(sym) or real(sym)
+        box = [ct("2024-03-12 03:00:03").tz_convert("UTC")]
+        feed.now = box[0]
+        runner = self._runner(feed, box)
+        runner.warm_up()
+        self.assertEqual(runner.step(), [])
+        self.assertEqual(calls, [])  # nights: no polling, no scanning
+
+    def test_push_summary_is_opt_in(self):
+        sent = []
+        ev = ScanEvent(ns("2024-03-12 08:25"), "ES", "PREMARKET", "summary")
+        AlertSink(webhook="https://example.invalid/h", send=lambda u, t: sent.append(t), echo=lambda t: None).emit(ev)
+        self.assertEqual(sent, [])
+        AlertSink(webhook="https://example.invalid/h", send=lambda u, t: sent.append(t), echo=lambda t: None,
+                  push_summary=True).emit(ev)
+        self.assertEqual(sent, ["summary"])
+
+    def test_alpaca_timeout_becomes_data_error(self):
+        import urllib.request
+        from fbt.feeds import AlpacaFeed
+        f = AlpacaFeed(env=TestAlpacaYahooETF.ENV)
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(TimeoutError("timed out"))
+        try:
+            with self.assertRaisesRegex(DataError, "TimeoutError"):
+                f.recent("SPY")
+        finally:
+            urllib.request.urlopen = orig
+
+
 class TestAlpacaYahooETF(unittest.TestCase):
     ENV = {"APCA_API_KEY_ID": "test-id-not-real", "APCA_API_SECRET_KEY": "test-secret-not-real"}
 

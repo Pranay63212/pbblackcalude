@@ -216,6 +216,12 @@ python -m fbt.scanner replay --data data/ES_1m.csv.gz --symbol ES --date 2024-03
 - **Phone alerts:** set the environment variable `FBT_ALERT_WEBHOOK` to an ntfy.sh topic URL
   or a Discord webhook. Never put it in a file in this repository.
 - Alerts are also logged to `results/alerts.csv`.
+- **Unattended use:** start it once and leave it running; it is idle at night and on weekends
+  and scans 08:25-10:00 CT each weekday. Network errors, timeouts and failed history loads
+  are reported and retried every minute instead of stopping the program. Add
+  `--push-summary` to receive the 08:25 summary on your phone as a daily "still running"
+  check. Keep the computer on, logged in, plugged in and set never to sleep, and set Windows
+  Update "active hours" to cover the morning so it doesn't restart then.
 - `replay` rehearses a past day through the same code, to check alerts against a chart.
 
 ## Free real-data backtest (Yahoo Finance)

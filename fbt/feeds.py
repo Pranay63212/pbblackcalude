@@ -254,6 +254,8 @@ class AlpacaFeed:
             raise DataError(f"Alpaca data request failed: HTTP {exc.code}") from None
         except urllib.error.URLError as exc:
             raise DataError(f"Could not reach Alpaca: {exc.reason}") from None
+        except (TimeoutError, OSError, ValueError) as exc:  # timeouts, dropped connections, bad JSON
+            raise DataError(f"Alpaca data request failed: {type(exc).__name__}") from None
 
     def _bars(self, symbol: str, timeframe: str, start: pd.Timestamp, end: pd.Timestamp) -> list:
         from urllib.parse import urlencode

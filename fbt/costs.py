@@ -20,6 +20,10 @@ DEFAULT_COMMISSION_PER_SIDE = {
     "NQ": 2.50,
     "MES": 0.85,
     "MNQ": 0.85,
+    "YM": 2.50,
+    "MYM": 0.85,
+    "GC": 2.50,
+    "MGC": 0.85,
 }
 # Slippage in ticks applied to every market order and every stop order fill.
 DEFAULT_MARKET_SLIPPAGE_TICKS = 1
@@ -40,7 +44,7 @@ class InstrumentSpec:
         return self.tick_value / self.tick_size
 
     def round_to_tick(self, price: float) -> float:
-        return round(price / self.tick_size) * self.tick_size
+        return round(round(price / self.tick_size) * self.tick_size, 10)
 
 
 INSTRUMENTS = {
@@ -48,7 +52,18 @@ INSTRUMENTS = {
     "NQ": InstrumentSpec("NQ", 0.25, 5.00),
     "MES": InstrumentSpec("MES", 0.25, 1.25),
     "MNQ": InstrumentSpec("MNQ", 0.25, 0.50),
+    "YM": InstrumentSpec("YM", 1.0, 5.00),      # E-mini Dow
+    "MYM": InstrumentSpec("MYM", 1.0, 0.50),    # Micro E-mini Dow
+    "GC": InstrumentSpec("GC", 0.10, 10.00),    # COMEX gold
+    "MGC": InstrumentSpec("MGC", 0.10, 1.00),   # Micro gold
 }
+
+# Exchange of each root (used by live data adapters).
+EXCHANGES = {"ES": "CME", "MES": "CME", "NQ": "CME", "MNQ": "CME",
+             "YM": "CBOT", "MYM": "CBOT", "GC": "COMEX", "MGC": "COMEX"}
+
+# Spec 1.4 compares ES and NQ. Micros pair with micros.
+SMT_PAIRS = {"ES": "NQ", "NQ": "ES", "MES": "MNQ", "MNQ": "MES"}
 
 
 def get_instrument(symbol: str) -> InstrumentSpec:

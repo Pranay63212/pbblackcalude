@@ -301,10 +301,52 @@ def resample(m1: Bars, tf: str, trading_dates: Optional[np.ndarray] = None,
     return Bars(tf, open_time, close_time, o, h, l, c, v)
 
 
+def daily_bars_from_frame(daily: pd.DataFrame) -> Bars:
+    """Daily OHLCV indexed by trading date -> Bars spanning 17:00 CT (prior day) to 17:00 CT."""
+    if daily is None or len(daily) == 0:
+        raise DataError("daily history is empty")
+    missing = [c for c in REQUIRED if c not in daily.columns]
+    if missing:
+        raise DataError(f"daily history missing columns {missing}")
+    idx = pd.DatetimeIndex(daily.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    td = idx.normalize().to_numpy(dtype="datetime64[D]")
+    if len(td) > 1 and not (np.diff(td.astype("int64")) > 0).all():
+        raise DataError("daily history dates must be unique and increasing")
+    vals = daily[list(REQUIRED)].to_numpy(dtype=float)
+    if not np.isfinite(vals).all():
+        raise DataError("daily history has missing values")
+    o, h, l, c, v = vals.T
+    if (h < l).any() or (h < np.maximum(o, c)).any() or (l > np.minimum(o, c)).any() or (vals[:, :4] <= 0).any():
+        raise DataError("daily history has inconsistent OHLC values")
+    open_t = _session_open_ns(td)
+    close_t = _session_open_ns(td + np.timedelta64(1, "D"))
+    return Bars("1d", open_t, close_t, o, h, l, c, v)
+
+
+def _merge_daily(daily: pd.DataFrame, derived: Bars, first_trading_date, symbol: str) -> Bars:
+    """External daily bars for dates before the first FULL 1m session, derived bars after."""
+    ext = daily_bars_from_frame(daily)
+    cutoff = _session_open_ns(np.array([first_trading_date + np.timedelta64(1, "D")]))[0]
+    keep_ext = ext.open_time < cutoff
+    keep_der = derived.open_time >= cutoff
+    cat = lambda a, b: np.concatenate([a[keep_ext], b[keep_der]])  # noqa: E731
+    merged = Bars("1d", cat(ext.open_time, derived.open_time), cat(ext.close_time, derived.close_time),
+                  cat(ext.open, derived.open), cat(ext.high, derived.high), cat(ext.low, derived.low),
+                  cat(ext.close, derived.close), cat(ext.volume, derived.volume))
+    if len(merged) > 1 and not (np.diff(merged.open_time) > 0).all():
+        raise DataError(f"{symbol}: daily history overlaps the 1-minute data inconsistently")
+    return merged
+
+
 class MultiTimeframeData:
     """1-minute data plus every derived timeframe, built once up front."""
 
-    def __init__(self, df: pd.DataFrame, symbol: str, timeframes: Iterable[str] = ALL_TIMEFRAMES):
+    def __init__(self, df: pd.DataFrame, symbol: str, timeframes: Iterable[str] = ALL_TIMEFRAMES,
+                 daily_history: Optional[pd.DataFrame] = None):
+        """`daily_history` (optional): daily OHLCV indexed by trading date, used only for
+        trading dates before the 1-minute data fully covers a session (live warm-up)."""
         validate_ohlcv(df, source=symbol)
         self.symbol = symbol
         self.m1 = bars_from_frame(df)
@@ -314,6 +356,8 @@ class MultiTimeframeData:
         for tf in timeframes:
             self.bars[tf] = resample(self.m1, tf, dates, opens)
         self.bars["1m"] = self.m1
+        if daily_history is not None and "1d" in self.bars:
+            self.bars["1d"] = _merge_daily(daily_history, self.bars["1d"], dates[0], symbol)
         local = pd.DatetimeIndex(self.m1.close_time).tz_localize("UTC").tz_convert(CHICAGO)
         # minute-of-day (local) of each 1m bar's CLOSE, and its local calendar date
         self.close_minute_of_day = (local.hour * 60 + local.minute).to_numpy(dtype=np.int32)

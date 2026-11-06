@@ -1071,5 +1071,204 @@ class TestStats(unittest.TestCase):
         self.assertGreater(s["p_value_win_rate_vs_50pct"], 0.5)
 
 
+# ===========================================================================
+# Scanner and live feeds (alerts only, no orders)
+# ===========================================================================
+from fbt import scanner as scanner_mod  # noqa: E402
+from fbt.feeds import (ReplayFeed, completed_only, current_trading_date, ib_bars_to_frame,  # noqa: E402
+                       ib_daily_to_frame, IBKRFeed, merge_bars)
+from fbt.scanner import AlertSink, LiveRunner, ScanEvent, Scanner, replay_day  # noqa: E402
+
+
+def _fixed_scanner(cfg, direction=BULLISH, symbols=("ES",)):
+    return Scanner(cfg, list(symbols), strategy_factory=lambda s: FixedBiasStrategy(cfg, ES, direction))
+
+
+class TestScanner(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.df = bullish_scenario_df()
+        cls.cfg = scenario_config()
+        cls.data = {"ES": MultiTimeframeData(cls.df, "ES")}
+        cls.events = replay_day(_fixed_scanner(cls.cfg), cls.data, "2024-03-12")
+        cls.trade = Backtester(cls.data["ES"], cls.cfg, strategy=FixedBiasStrategy(cls.cfg, ES, BULLISH)).run().trades[0]
+
+    def test_signal_matches_backtester(self):
+        sig = [e for e in self.events if e.kind == "SIGNAL"]
+        self.assertEqual(len(sig), 1)
+        s = sig[0].data["signal"]
+        t = self.trade
+        self.assertEqual(sig[0].time, t.signal_time)
+        self.assertEqual((s["entry_price"], s["stop"], s["target"]), (t.planned_entry, t.initial_stop, t.target))
+        self.assertIn("ES LONG SIGNAL 09:00 CT", sig[0].text)
+        self.assertIn("Stop  102.50", sig[0].text)
+        self.assertIn("MES:", sig[0].text)  # micro sizing shown too
+
+    def test_premarket_once_and_setup_forming_before_signal(self):
+        kinds = [e.kind for e in self.events]
+        self.assertEqual(kinds.count("PREMARKET"), 1)
+        self.assertLess(kinds.index("PREMARKET"), kinds.index("SETUP_FORMING"))
+        self.assertLess(kinds.index("SETUP_FORMING"), kinds.index("SIGNAL"))
+        forming = [e.text for e in self.events if e.kind == "SETUP_FORMING"]
+        self.assertTrue(any("5m candle body close above 109.75" in f for f in forming))
+
+    def test_no_signals_outside_session(self):
+        cfg = copy.deepcopy(self.cfg)
+        cfg["execution"]["session"]["end"] = "08:45"
+        ev = replay_day(_fixed_scanner(cfg), self.data, "2024-03-12")
+        self.assertFalse(any(e.kind == "SIGNAL" for e in ev))
+        sc = _fixed_scanner(self.cfg)
+        self.assertEqual(sc.scan(self.data, ns("2024-03-12 10:30")), [])
+
+    def test_scanner_never_trades(self):
+        src = open(scanner_mod.__file__).read() + open(sys.modules["fbt.feeds"].__file__).read()
+        for forbidden in ("PaperBroker", ".submit(", "placeOrder", "MarketOrder", "LimitOrder"):
+            self.assertNotIn(forbidden, src)
+
+    def _runner(self, df, clock_box, cfg=None, sink_events=None, forming=True):
+        feed = ReplayFeed({"ES": df}, include_forming_bar=forming)
+
+        def clock():
+            feed.now = clock_box[0]
+            return clock_box[0]
+        sink = AlertSink(webhook="", echo=lambda text: None)
+        if sink_events is not None:
+            sink.emit = lambda ev: sink_events.append(ev)
+        return LiveRunner(_fixed_scanner(cfg or self.cfg), feed, sink, clock=clock), feed
+
+    def test_live_runner_only_sees_completed_bars_and_matches_backtest(self):
+        box = [ct("2024-03-12 08:00:03").tz_convert("UTC")]
+        out = []
+        runner, feed = self._runner(self.df, box, sink_events=out)
+        runner.warm_up()
+        while box[0] <= ct("2024-03-12 09:05:03"):
+            runner.step()
+            last = runner.store["ES"].index[-1]
+            self.assertLessEqual(last + pd.Timedelta(minutes=1), box[0])  # forming bar never stored
+            box[0] += pd.Timedelta(minutes=1)
+        sig = [e for e in out if e.kind == "SIGNAL"]
+        self.assertEqual(len(sig), 1)
+        self.assertEqual(sig[0].data["signal"]["entry_price"], self.trade.planned_entry)
+        self.assertEqual(sig[0].data["signal"]["stop"], self.trade.initial_stop)
+
+    def test_stale_and_invalid_data_are_reported_not_scanned(self):
+        box = [ct("2024-03-12 08:45:03").tz_convert("UTC")]
+        cut = self.df[self.df.index < ct("2024-03-12 08:35").tz_convert("UTC")]  # feed stopped at 08:35
+        out = []
+        runner, _ = self._runner(cut, box, sink_events=out)
+        runner.warm_up()
+        runner.step()
+        self.assertEqual([e.kind for e in out], ["STALE"])
+        bad = self.df.copy()
+        i = bad.index.get_loc(ct("2024-03-12 08:44").tz_convert("UTC"))
+        bad.iloc[i, bad.columns.get_loc("low")] = bad.iloc[i]["high"] + 5  # low above high
+        out2 = []
+        runner2, _ = self._runner(bad, box, sink_events=out2)
+        runner2.warm_up()
+        runner2.step()
+        self.assertTrue(any(e.kind == "DATA_ERROR" for e in out2))
+        self.assertFalse(any(e.kind == "SIGNAL" for e in out2))
+
+    def test_alert_sink_webhook_and_log(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "alerts.csv")
+            sink = AlertSink(log_path=log, webhook="https://example.invalid/hook",
+                             send=lambda url, text: sent.append(text), echo=lambda t: None)
+            sink.emit(ScanEvent(ns("2024-03-12 09:00"), "ES", "SIGNAL", "ES LONG\nline2"))
+            sink.emit(ScanEvent(ns("2024-03-12 08:25"), "ES", "PREMARKET", "summary"))
+            self.assertEqual(sent, ["ES LONG\nline2"])           # pre-session summary is not pushed
+            self.assertEqual(len(pd.read_csv(log)), 2)
+
+            def boom(url, text):
+                raise OSError("network down")
+            msgs = []
+            AlertSink(webhook="https://example.invalid/hook", send=boom, echo=msgs.append).emit(
+                ScanEvent(0, "ES", "SIGNAL", "x"))
+            self.assertIn("webhook failed", msgs[-1])             # failure reported, no crash
+        quiet = AlertSink(webhook="", send=lambda u, t: sent.append("BAD"), echo=lambda t: None)
+        quiet.emit(ScanEvent(0, "ES", "SIGNAL", "x"))
+        self.assertNotIn("BAD", sent)
+
+
+class _FakeBar:
+    def __init__(self, date, o, h, l, c, v=1.0):
+        self.date, self.open, self.high, self.low, self.close, self.volume = date, o, h, l, c, v
+
+
+class TestFeeds(unittest.TestCase):
+    def test_completed_only_and_merge(self):
+        idx = pd.date_range("2024-03-12 14:00", periods=3, freq="1min", tz="UTC")
+        df = pd.DataFrame({"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0}, index=idx)
+        self.assertEqual(len(completed_only(df, pd.Timestamp("2024-03-12 14:02:30", tz="UTC"))), 2)
+        self.assertEqual(len(completed_only(df, pd.Timestamp("2024-03-12 14:03", tz="UTC"))), 3)
+        newer = df.iloc[-1:].copy()
+        newer["close"] = 1.75
+        m = merge_bars(df, newer)
+        self.assertEqual(len(m), 3)
+        self.assertEqual(m["close"].iloc[-1], 1.75)
+
+    def test_ib_conversions(self):
+        bars = [_FakeBar(pd.Timestamp("2024-03-12 14:00", tz="UTC").to_pydatetime(), 1, 2, 0.5, 1.5),
+                _FakeBar(pd.Timestamp("2024-03-12 09:01", tz=CT).to_pydatetime(), 1, 2, 0.5, 1.5, -1)]
+        df = ib_bars_to_frame(bars)
+        self.assertEqual(list(df.index), [pd.Timestamp("2024-03-12 14:00", tz="UTC"),
+                                          pd.Timestamp("2024-03-12 14:01", tz="UTC")])
+        self.assertEqual(df["volume"].iloc[1], 0.0)  # IB's -1 'no volume' never becomes negative
+        import datetime as dt
+        daily = [_FakeBar(dt.date(2024, 3, 8), 1, 2, .5, 1.5), _FakeBar(dt.date(2024, 3, 11), 1, 2, .5, 1.5),
+                 _FakeBar(dt.date(2024, 3, 12), 1, 2, .5, 1.5)]
+        d = ib_daily_to_frame(daily, dt.date(2024, 3, 12))
+        self.assertEqual(len(d), 2)  # today's unfinished day is dropped
+        self.assertEqual(current_trading_date(pd.Timestamp("2024-03-12 23:30", tz="UTC")), dt.date(2024, 3, 13))
+
+    def test_ibkr_feed_with_fake_client(self):
+        class FakeIB:
+            def __init__(self):
+                self.calls = []
+
+            def reqHistoricalData(self, contract, endDateTime, durationStr, barSizeSetting, whatToShow,
+                                  useRTH, formatDate):
+                self.calls.append((durationStr, barSizeSetting, formatDate, useRTH))
+                base = pd.Timestamp("2024-03-12 14:00", tz="UTC") - pd.Timedelta(days=len(self.calls) - 1)
+                return [_FakeBar((base + pd.Timedelta(minutes=k)).to_pydatetime(), 10, 11, 9, 10.5)
+                        for k in range(3)]
+
+        feed = IBKRFeed(ib=FakeIB(), pacing_seconds=0)
+        feed._contracts["ES"] = object()  # skip contract lookup (needs a live TWS)
+        hist = feed.history("ES", 3)
+        self.assertEqual(len(hist), 9)
+        self.assertTrue(hist.index.is_monotonic_increasing)
+        self.assertTrue(all(c == ("1 D", "1 min", 2, False) for c in feed.ib.calls))
+        self.assertEqual(len(feed.recent("ES")), 3)
+
+    def test_daily_history_merge_and_validation(self):
+        df = random_walk_df(days=5, seed=8, start="2024-03-11")
+        derived = MultiTimeframeData(df, "ES").bars["1d"]
+        ext = pd.DataFrame({"open": [4000.0, 4010.0], "high": [4020.0, 4030.0], "low": [3990.0, 4000.0],
+                            "close": [4010.0, 4020.0], "volume": [1.0, 1.0]},
+                           index=pd.to_datetime(["2024-03-07", "2024-03-08"]))
+        data = MultiTimeframeData(df, "ES", daily_history=ext)
+        d = data.bars["1d"]
+        self.assertEqual(len(d), len(derived) - 1 + 2)  # first (partial) 1m day replaced by history
+        self.assertEqual(ns_to_chicago(d.open_time[0]).strftime("%Y-%m-%d %H:%M"), "2024-03-06 17:00")
+        self.assertEqual(d.close[0], 4010.0)
+        # a historical daily bar is only visible after its session closes
+        self.assertEqual(data.view(int(d.close_time[1]) - 1).count("1d"), 1)
+        bad = ext.copy()
+        bad.iloc[0, bad.columns.get_loc("low")] = 5000.0
+        with self.assertRaises(DataError):
+            MultiTimeframeData(df, "ES", daily_history=bad)
+
+    def test_new_instruments_and_cost_floors(self):
+        floors = {"YM": 2.50, "MYM": 0.85, "GC": 2.50, "MGC": 0.85}
+        for sym, floor in floors.items():
+            self.assertGreaterEqual(costs_mod.DEFAULT_COMMISSION_PER_SIDE[sym], floor, sym)
+        self.assertEqual(get_instrument("GCJ4").point_value, 100.0)
+        self.assertEqual(get_instrument("MGCJ4").symbol, "MGC")
+        self.assertEqual(get_instrument("YMH4").point_value, 5.0)
+        self.assertEqual(get_instrument("MYM").point_value, 0.5)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

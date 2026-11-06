@@ -2,3 +2,5 @@ numpy>=1.26
 pandas>=2.1
 # optional, only for reading .dbn.zst files:
 # databento>=0.40
+# optional, only for the live scanner's Interactive Brokers feed:
+# ib_async>=2.0

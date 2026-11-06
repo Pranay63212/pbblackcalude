@@ -56,6 +56,8 @@ class Decision:
     bias_direction: str = NEUTRAL
     key_level_ids: List[str] = field(default_factory=list)
     signal: Optional[Signal] = None
+    # Informational only (bias, draw, levels, what the setup waits for). Never used for decisions.
+    detail: dict = field(default_factory=dict)
 
     def fingerprint(self) -> tuple:
         """Compact, comparable summary (used by lookahead tests)."""
@@ -85,6 +87,7 @@ class PBBlakeStrategy:
             raise ValueError(f"Unknown stop method {self.exe['stop_loss']['default']}")
         self.tracker = TouchTracker()
         self._bias_cache = {}
+        self._setup: dict = {}
 
     # ------------------------------------------------------------------
     def _bias(self, view: MarketView, smt_view: Optional[MarketView]) -> dict:
@@ -107,37 +110,45 @@ class PBBlakeStrategy:
         # STEP 1: higher-timeframe bias
         bias = self._bias(view, smt_view)
         direction = bias["direction"]
+        detail = {"bias": bias}
         if direction == NEUTRAL:
-            return Decision(now, "NO_TRADE", "BIAS_NEUTRAL", NEUTRAL)
+            return Decision(now, "NO_TRADE", "BIAS_NEUTRAL", NEUTRAL, detail=detail)
         draw = identify_draw_on_liquidity(view, direction, self.cfg, self.tick)
         if draw is None:
-            return Decision(now, "NO_TRADE", "NO_DRAW_ON_LIQUIDITY", direction)
+            return Decision(now, "NO_TRADE", "NO_DRAW_ON_LIQUIDITY", direction, detail=detail)
         bias["draw_on_liquidity"] = draw["price"]
         bias["liquidity_type"] = draw["liquidity_type"]
+        detail["draw"] = draw
 
         # STEP 2: key levels
         levels, _ = identify_key_levels(view, direction, self.cfg, self.tick, self.tracker,
                                         exclude_ids=ctx.exclude_level_ids, smt=bias.get("smt_confirmation"))
         ids = [l.id for l in levels]
+        detail["levels"] = [{"type": l.type, "timeframe": l.timeframe, "upper": l.upper_boundary,
+                             "lower": l.lower_boundary, "touch_time": l.touch_time if l.touch_index >= 0 else None,
+                             "id": l.id} for l in levels]
         if not levels:
-            return Decision(now, "WAIT", "NO_KEY_LEVELS", direction)
+            return Decision(now, "WAIT", "NO_KEY_LEVELS", direction, detail=detail)
 
         # STEP 3: price must have traded into a level
         touched = [l for l in levels if l.touch_index >= 0]
         if ctx.require_touch_after_ns is not None:
             touched = [l for l in touched if l.touch_time > ctx.require_touch_after_ns]
         if not touched:
-            return Decision(now, "WAIT", "NO_KEY_LEVEL_REACTION", direction, ids)
+            return Decision(now, "WAIT", "NO_KEY_LEVEL_REACTION", direction, ids, detail=detail)
 
         reason, final_status = "WAIT", "WAIT"
         for level in touched:
+            self._setup = {"active_level": level.id}
             status, why, signal = self._setup_from_level(view, level, direction, bias, draw)
             if signal is not None:
-                return Decision(now, "SIGNAL", "IFVG_CONFIRMED", direction, ids, signal)
+                detail["setup"] = self._setup
+                return Decision(now, "SIGNAL", "IFVG_CONFIRMED", direction, ids, signal, detail=detail)
             if reason == "WAIT":
                 reason = why
                 final_status = status
-        return Decision(now, final_status, reason, direction, ids)
+                detail["setup"] = self._setup
+        return Decision(now, final_status, reason, direction, ids, detail=detail)
 
     # ------------------------------------------------------------------
     def _setup_from_level(self, view: MarketView, level: KeyLevel, direction: str, bias: dict, draw: dict):
@@ -145,11 +156,13 @@ class PBBlakeStrategy:
         leg = identify_manipulation_leg(view, level, direction, self.cfg)
         if leg is None:
             return "WAIT", "NO_MANIPULATION_LEG", None
+        self._setup["leg"] = leg.to_dict()
         # STEP 5: highest-timeframe IFVG inside the leg
         min_size = self.cfg["min_fvg_ticks"] * self.tick
         gap = find_highest_timeframe_ifvg(view, leg, direction, self.cfg["ifvg_timeframes"], min_size)
         if gap is None:
             return "WAIT", "NO_IFVG_IN_LEG", None
+        self._setup["ifvg"] = {"timeframe": gap.tf, "upper": gap.top, "lower": gap.bottom}
         # STEP 6: body close through it on its own timeframe, exactly now
         state, inv_idx = ifvg_inversion_state(view, gap, direction)
         if state == "PENDING":
@@ -236,7 +249,8 @@ class PBBlakeStrategy:
         stop = float(ref) - buf if bull else float(ref) + buf
         # round away from entry onto the tick grid
         t = self.tick
-        return float(np.floor(stop / t + 1e-9) * t) if bull else float(np.ceil(stop / t - 1e-9) * t)
+        stop = np.floor(stop / t + 1e-9) * t if bull else np.ceil(stop / t - 1e-9) * t
+        return round(float(stop), 10)
 
     def _break_even_reference(self, direction, entry, stop, target, leg: ManipulationLeg) -> Optional[float]:
         be = self.exe["break_even"]

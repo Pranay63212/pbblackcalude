@@ -176,6 +176,42 @@ each defines how an existing concept is measured.
 19. **Session (4.6)**: a 1m bar whose close falls within 08:30–10:00 CT can trigger an entry. The 30-second chart isn't used.
 20. **Safety flatten**: open positions are closed at 15:50 CT, before the CME halt. This only ever exits a position.
 
+## Live scanner (alerts only, never trades)
+
+`fbt/scanner.py` watches ES, NQ, YM and GC (alerts show full-size and micro sizing) and
+runs the **same strategy code** as the backtester, a few seconds after each 1-minute
+candle closes. Signals are reported only between 08:30 and 10:00 CT.
+
+| Alert | Meaning |
+|---|---|
+| Pre-session (08:25 CT) | Bias per timeframe, draw on liquidity, current key levels |
+| Setup forming | Price traded into a key level; waiting for the highest-timeframe IFVG to invert |
+| **Signal** | Every rule met: entry, stop, target, R:R, the setup's details, and contracts for your risk settings |
+| Stale / data error | Data stopped or is invalid; the symbol is not scanned until data is good again |
+
+Checking more often than once a minute adds nothing: the rules act only on completed
+candle body closes, and the smallest candle is 1 minute.
+
+The scanner cannot see your fills, so the daily limits (spec 4.5) are printed as a
+reminder rather than enforced. It contains no order code (a test checks this).
+
+```bash
+python -m fbt.scanner live --feed ibkr --symbols ES NQ YM GC      # TWS paper on port 7497
+python -m fbt.scanner live --feed ibkr --port 4002               # IB Gateway paper
+python -m fbt.scanner live --feed csv --folder data/live         # <SYMBOL>.csv files kept up to date
+python -m fbt.scanner replay --data data/ES_1m.csv.gz --symbol ES --date 2024-03-12
+```
+
+- **Interactive Brokers:** run TWS or IB Gateway logged in to the paper account. Enable the
+  API under *Global Configuration → API → Settings*. The account needs real-time market data
+  for CME, CBOT and COMEX; without it IB sends delayed data or none. The connection is
+  read-only. On first start it loads 20 days of 1-minute bars plus a year of daily bars,
+  which takes a few minutes. The front-month contract is used, so expect oddities around rolls.
+- **Phone alerts:** set the environment variable `FBT_ALERT_WEBHOOK` to an ntfy.sh topic URL
+  or a Discord webhook. Never put it in a file in this repository.
+- Alerts are also logged to `results/alerts.csv`.
+- `replay` rehearses a past day through the same code, to check alerts against a chart.
+
 ## Known limitations
 
 - The bar-based fill model can't see order-book queue position or intrabar order. The

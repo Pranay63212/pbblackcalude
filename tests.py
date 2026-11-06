@@ -1348,6 +1348,229 @@ class TestUnattendedRunning(unittest.TestCase):
             urllib.request.urlopen = orig
 
 
+class FakeAlpacaTrading:
+    """Stand-in for Alpaca's paper Trading API. Records every call."""
+
+    def __init__(self, equity="100000"):
+        from fbt.trader import PAPER_URL
+        self.base = PAPER_URL
+        self.calls, self.positions, self.open, self.orders = [], [], [], {}
+        self.equity = equity
+        self.n = 0
+
+    def __call__(self, method, url, headers, body):
+        assert url.startswith(self.base), url                 # paper endpoint only
+        assert headers["APCA-API-KEY-ID"] and "secret" not in url
+        self.calls.append((method, url[len(self.base):], body))
+        path = url[len(self.base):]
+        if method == "GET" and path == "/account":
+            return {"equity": self.equity}
+        if method == "GET" and path == "/positions":
+            return self.positions
+        if method == "GET" and path.startswith("/orders?status=open"):
+            return self.open
+        if method == "GET" and path.startswith("/orders/"):
+            return self.orders[path.split("/")[2].split("?")[0]]
+        if method == "POST" and path == "/orders":
+            self.n += 1
+            oid = f"o{self.n}"
+            self.orders[oid] = {"id": oid, "status": "new", "symbol": body["symbol"],
+                                "legs": [{"id": oid + "-tp", "type": "limit", "status": "new"},
+                                         {"id": oid + "-sl", "type": "stop", "status": "held"}]}
+            return self.orders[oid]
+        if method == "DELETE" and path.startswith("/orders/"):
+            leg_id = path.split("/")[2]
+            for o in self.orders.values():
+                for leg in o.get("legs", []):
+                    if leg["id"] == leg_id:
+                        leg["status"] = "canceled"
+            return {}
+        if method == "DELETE" and path.startswith("/positions/"):
+            self.orders["close1"] = {"id": "close1", "status": "new", "symbol": path.split("/")[2], "legs": []}
+            return self.orders["close1"]
+        raise AssertionError(f"unexpected call {method} {path}")
+
+    def fill_entry(self, oid, price, qty=None):
+        o = self.orders[oid]
+        o.update(status="filled", filled_avg_price=str(price), filled_qty=str(qty or 0) if qty else None)
+        o["legs"][1]["status"] = "new"
+
+    def posts(self):
+        return [c for c in self.calls if c[0] == "POST"]
+
+
+class TestPaperTrader(unittest.TestCase):
+    KEYS = {"APCA_API_KEY_ID": "test-id-not-real", "APCA_API_SECRET_KEY": "test-secret-not-real"}
+
+    def setUp(self):
+        from fbt.trader import AlpacaPaperBroker, PaperTrader
+        self.tmp = tempfile.TemporaryDirectory()
+        self.api = FakeAlpacaTrading()
+        self.cfg = default_config()
+        self.day = pd.Timestamp.now(tz=CT).normalize()
+        self.trader = PaperTrader(self.cfg, lambda rm: AlpacaPaperBroker(rm, http=self.api, env=self.KEYS), ["SPY"],
+                                  state_path=os.path.join(self.tmp.name, "state.json"),
+                                  trades_log=os.path.join(self.tmp.name, "trades.csv"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def at(self, hhmm):
+        h, m = map(int, hhmm.split(":"))
+        return (self.day + pd.Timedelta(hours=h, minutes=m, seconds=3)).tz_convert("UTC")
+
+    def signal_event(self, hhmm, direction=BULLISH, entry=100.0, stop=98.0, target=104.0, level="L1", touch=None):
+        t = int(self.at(hhmm).floor("min").value)
+        sig = make_signal(direction, entry, stop, target, t=t, level_id=level,
+                          touch=touch if touch is not None else t - 5 * NS_PER_MIN)
+        return ScanEvent(t, "SPY", "SIGNAL", "signal", {"signal": sig.to_dict()})
+
+    def kinds(self, evs):
+        return [e.kind for e in evs]
+
+    def test_mode_is_paper_only(self):
+        from fbt.trader import TradingError, build_paper_trader, resolve_trading_mode
+        self.assertEqual(resolve_trading_mode(False, env={}), "paper")
+        with self.assertRaisesRegex(TradingError, "LIVE_TRADING_CONFIRMED"):
+            resolve_trading_mode(True, env={})
+        with self.assertRaisesRegex(TradingError, "not implemented"):
+            resolve_trading_mode(True, env={"LIVE_TRADING_CONFIRMED": "yes"})
+        with self.assertRaisesRegex(TradingError, "feed alpaca"):
+            build_paper_trader(self.cfg, ["SPY"], feed_name="ibkr", env=self.KEYS)
+        with self.assertRaisesRegex(TradingError, "futures"):
+            build_paper_trader(self.cfg, ["ES"], feed_name="alpaca", env=self.KEYS)
+        with self.assertRaisesRegex(TradingError, "APCA_API_KEY_ID"):
+            build_paper_trader(self.cfg, ["SPY"], feed_name="alpaca", env={})
+
+    def test_orders_need_single_use_risk_approval(self):
+        from fbt.risk import RiskViolation
+        b = self.trader.broker
+        self.assertNotIn("test-secret", repr(b))
+        fake = Approval(999, make_signal(t=int(self.at("09:00").value)), 10, 20.0, 0)
+        with self.assertRaises(RiskViolation):
+            b.submit_bracket(fake, "SPY")
+        self.assertEqual(self.api.posts(), [])  # nothing reached Alpaca
+
+    def test_signal_becomes_bracket_order_then_win_stops_the_day(self):
+        evs = self.trader.on_minute(self.at("09:00"), [self.signal_event("09:00")])
+        self.assertEqual(self.kinds(evs), ["ORDER"])
+        (_, path, body), = self.api.posts()
+        self.assertEqual((body["side"], body["type"], body["order_class"], body["time_in_force"]),
+                         ("buy", "market", "bracket", "gtc"))
+        self.assertEqual((body["stop_loss"]["stop_price"], body["take_profit"]["limit_price"]), ("98.00", "104.00"))
+        # 0.5% of $100k = $500 / (2.00 stop + 0.01 commission + 0.02 slippage) per share = 246 shares
+        self.assertEqual(body["qty"], "246")
+        self.assertTrue(body["client_order_id"].startswith("pbb-SPY-"))
+        self.api.fill_entry("o1", 100.05)
+        self.assertEqual(self.kinds(self.trader.on_minute(self.at("09:01"), [])), ["FILL"])
+        self.assertEqual(self.trader.risk.day.trades, 1)
+        self.api.orders["o1"]["legs"][0].update(status="filled", filled_avg_price="104.00")
+        ev = self.trader.on_minute(self.at("09:20"), [])
+        self.assertEqual(self.kinds(ev), ["EXIT"])
+        self.assertIn("WIN", ev[0].text)
+        self.assertEqual(self.trader.risk.day.wins, 1)
+        # spec 4.5: one win -> done for the day
+        ev = self.trader.on_minute(self.at("09:40"), [self.signal_event("09:40", level="L2")])
+        self.assertEqual(self.kinds(ev), ["SKIPPED"])
+        self.assertIn("STOP_AFTER_WIN", ev[0].text)
+        self.assertEqual(len(self.api.posts()), 1)
+        log = pd.read_csv(os.path.join(self.tmp.name, "trades.csv"))
+        self.assertEqual(log["reason"].iloc[0], "TARGET")
+
+    def test_stop_loss_then_only_new_a_plus_setup(self):
+        self.trader.on_minute(self.at("09:00"), [self.signal_event("09:00")])
+        self.api.fill_entry("o1", 100.00)
+        self.trader.on_minute(self.at("09:01"), [])
+        self.api.orders["o1"]["legs"][1].update(status="filled", filled_avg_price="97.99")
+        ev = self.trader.on_minute(self.at("09:05"), [])
+        self.assertIn("LOSS", ev[0].text)
+        self.assertEqual(self.trader.risk.day.losses, 1)
+        same = self.trader.on_minute(self.at("09:10"), [self.signal_event("09:10", level="L1")])
+        self.assertIn("KEY_LEVEL_ALREADY_TRADED", same[0].text)
+        old = self.trader.on_minute(self.at("09:12"), [self.signal_event(
+            "09:12", level="L2", touch=int(self.at("09:02").floor("min").value))])
+        self.assertIn("NO_NEW_A_PLUS_SETUP", old[0].text)
+        new = self.trader.on_minute(self.at("09:20"), [self.signal_event("09:20", level="L3")])
+        self.assertEqual(self.kinds(new), ["ORDER"])
+
+    def test_existing_position_blocks_entry(self):
+        self.api.positions = [{"symbol": "SPY", "qty": "10"}]
+        ev = self.trader.on_minute(self.at("09:00"), [self.signal_event("09:00")])
+        self.assertIn("POSITION_ALREADY_OPEN", ev[0].text)
+        self.assertEqual(self.api.posts(), [])
+
+    def test_outside_session_signal_not_traded(self):
+        ev = self.trader.on_minute(self.at("10:05"), [self.signal_event("10:05")])
+        self.assertIn("OUTSIDE_SESSION", ev[0].text)
+        self.assertEqual(self.api.posts(), [])
+
+    def test_rejected_entry_is_not_a_trade(self):
+        self.trader.on_minute(self.at("09:00"), [self.signal_event("09:00")])
+        self.api.orders["o1"]["status"] = "rejected"
+        ev = self.trader.on_minute(self.at("09:01"), [])
+        self.assertEqual(self.kinds(ev), ["ORDER_ERROR"])
+        self.assertEqual(self.trader.risk.day.trades, 0)
+        self.assertIsNone(self.trader.open)
+
+    def test_flatten_before_etf_close(self):
+        self.trader.on_minute(self.at("09:00"), [self.signal_event("09:00")])
+        self.api.fill_entry("o1", 100.00)
+        self.trader.on_minute(self.at("09:01"), [])
+        self.assertEqual(self.trader.on_minute(self.at("14:49"), []), [])
+        ev = self.trader.on_minute(self.at("14:50"), [])
+        self.assertIn("end-of-day flatten", ev[0].text)
+        deletes = [c[1] for c in self.api.calls if c[0] == "DELETE"]
+        self.assertEqual(deletes, ["/orders/o1-tp", "/orders/o1-sl", "/positions/SPY"])
+        self.api.orders["close1"].update(status="filled", filled_avg_price="101.00")
+        ev = self.trader.on_minute(self.at("14:51"), [])
+        self.assertIn("FLATTEN_TIME", ev[0].text)
+        self.assertIsNone(self.trader.open)
+
+    def test_restart_same_day_remembers_open_trade_and_counts(self):
+        from fbt.trader import AlpacaPaperBroker, PaperTrader
+        self.trader.on_minute(self.at("09:00"), [self.signal_event("09:00")])
+        self.api.fill_entry("o1", 100.00)
+        self.trader.on_minute(self.at("09:01"), [])
+        again = PaperTrader(self.cfg, lambda rm: AlpacaPaperBroker(rm, http=self.api, env=self.KEYS), ["SPY"],
+                            state_path=self.trader.state_path, trades_log=self.trader.trades_log)
+        self.assertEqual(again.open.order_id, "o1")
+        self.assertEqual(again.risk.day.trades, 1)
+        self.assertTrue(again.risk.position_open)
+        state = open(self.trader.state_path).read()
+        self.assertNotIn("test-secret", state)
+        self.assertNotIn("test-id", state)
+
+    def test_live_runner_hands_signal_to_trader(self):
+        from fbt.trader import AlpacaPaperBroker, PaperTrader
+        df = bullish_scenario_df()
+        spy = get_instrument("SPY")
+        cfg = scenario_config()
+        api = FakeAlpacaTrading()
+        trader = PaperTrader(cfg, lambda rm: AlpacaPaperBroker(rm, http=api, env=self.KEYS), ["SPY"],
+                             state_path=None, trades_log=None)
+        feed = ReplayFeed({"SPY": df})
+        box = [ct("2024-03-12 08:58:03").tz_convert("UTC")]
+
+        def clock():
+            feed.now = box[0]
+            return box[0]
+        out = []
+        sink = AlertSink(webhook="", echo=lambda t: None)
+        sink.emit = lambda ev: out.append(ev)
+        scanner = Scanner(cfg, ["SPY"], strategy_factory=lambda s: FixedBiasStrategy(cfg, spy, BULLISH))
+        runner = LiveRunner(scanner, feed, sink, clock=clock, trader=trader)
+        runner.warm_up()
+        for _ in range(4):
+            runner.step()
+            box[0] += pd.Timedelta(minutes=1)
+        kinds = [e.kind for e in out]
+        self.assertIn("SIGNAL", kinds)
+        self.assertIn("ORDER", kinds)
+        body = api.posts()[0][2]
+        self.assertEqual(body["stop_loss"]["stop_price"], "102.74")   # leg low 102.75 - 1 cent
+        self.assertEqual(body["take_profit"]["limit_price"], "130.00")
+
+
 class TestAlpacaYahooETF(unittest.TestCase):
     ENV = {"APCA_API_KEY_ID": "test-id-not-real", "APCA_API_SECRET_KEY": "test-secret-not-real"}
 

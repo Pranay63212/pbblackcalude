@@ -224,6 +224,30 @@ python -m fbt.scanner replay --data data/ES_1m.csv.gz --symbol ES --date 2024-03
   Update "active hours" to cover the morning so it doesn't restart then.
 - `replay` rehearses a past day through the same code, to check alerts against a chart.
 
+## Automatic paper trading (Alpaca, paper only)
+
+```bash
+python -m fbt.scanner live --feed alpaca --trade --push-summary
+```
+
+With `--trade`, each signal on SPY/QQQ/DIA/GLD becomes one **bracket order** in your
+Alpaca **paper** account: a market entry plus a stop-loss and a take-profit, both held at
+Alpaca (good-till-cancelled), so the stop stays in place even if this computer turns off.
+
+- Every order needs a single-use approval from the RiskManager: entries only 08:30-10:00 CT,
+  sizing at 0.5% of the paper account's equity, minimum stop 10 cents, and the spec 4.5
+  daily limits applied across all four symbols (stop after a win; after a loss only a new A+
+  setup on a different, newly touched level; at most two trades).
+- No entry while any position or open order exists in a traded symbol.
+- Open trades are closed at 14:50 CT (`--flatten-time`), before the 15:00 CT ETF close.
+- Order placed, fill and exit (with estimated P&L and R) are pushed to your phone; trades
+  go to `results/paper_trades.csv`; the day's state is kept in `results/trader_state.json`
+  so a restart the same day remembers it.
+- **Paper only:** orders go to `paper-api.alpaca.markets`. `--live` needs
+  `LIVE_TRADING_CONFIRMED=yes` and is still refused: live trading is not implemented.
+- Order code lives only in `fbt/trader.py`; the scanner module itself never places orders.
+- Tested against a stand-in for Alpaca's API, not yet against Alpaca's servers.
+
 ## Free real-data backtest (Yahoo Finance)
 
 ```bash

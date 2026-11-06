@@ -1,4 +1,6 @@
-"""Live strategy scanner: watches markets and ALERTS. It never places orders.
+"""Live strategy scanner: watches markets and ALERTS. This module never places orders.
+With --trade, signals are handed to fbt/trader.py, which sends PAPER orders only
+after RiskManager approval.
 
 Once per minute, a few seconds after each 1-minute candle closes, it runs the
 same PBBlakeStrategy the backtester uses on completed bars only. It reports:
@@ -218,7 +220,7 @@ class Scanner:
 # alert sinks
 # ---------------------------------------------------------------------------
 class AlertSink:
-    PUSH_KINDS = ("SIGNAL", "SETUP_FORMING", "STALE", "DATA_ERROR")
+    PUSH_KINDS = ("SIGNAL", "SETUP_FORMING", "STALE", "DATA_ERROR", "ORDER", "FILL", "EXIT", "ORDER_ERROR", "SKIPPED")
 
     def __init__(self, log_path: Optional[str] = None, webhook: Optional[str] = None,
                  send: Optional[Callable[[str, str], None]] = None, echo: Callable[[str], None] = print,
@@ -261,7 +263,9 @@ class LiveRunner:
     """Polls a feed once a minute, keeps completed bars, rebuilds timeframes, scans."""
 
     def __init__(self, scanner: Scanner, feed, sink: AlertSink, history_days: int = 20,
-                 stale_minutes: float = 3.0, clock: Callable[[], pd.Timestamp] = lambda: pd.Timestamp.now(tz="UTC")):
+                 stale_minutes: float = 3.0, clock: Callable[[], pd.Timestamp] = lambda: pd.Timestamp.now(tz="UTC"),
+                 trader=None):
+        self.trader = trader  # optional PaperTrader (paper orders through the RiskManager)
         self.scanner = scanner
         self.feed = feed
         self.sink = sink
@@ -330,6 +334,12 @@ class LiveRunner:
             events += self.scanner.scan(data, now_ns)
         except Exception as exc:
             events.append(ScanEvent(now_ns, "-", "DATA_ERROR", f"Scanner error (still running): {_describe(exc)}"))
+        if self.trader is not None:
+            try:
+                for te in self.trader.on_minute(now, list(events)):
+                    events.append(ScanEvent(te.time, te.symbol, te.kind, te.text, te.data))
+            except Exception as exc:  # report loudly, keep running; open stops are held at Alpaca
+                events.append(ScanEvent(now_ns, "-", "ORDER_ERROR", f"TRADER ERROR (still running): {_describe(exc)}"))
         for ev in events:
             self.sink.emit(ev)
         return events
@@ -385,6 +395,10 @@ def main(argv=None) -> int:
     lv.add_argument("--client-id", type=int, default=17)
     lv.add_argument("--history-days", type=int, default=20)
     lv.add_argument("--log", default="results/alerts.csv")
+    lv.add_argument("--trade", action="store_true",
+                    help="auto PAPER trade signals on Alpaca with bracket orders (entry + stop-loss + target)")
+    lv.add_argument("--live", action="store_true", help="refused: live trading is not implemented")
+    lv.add_argument("--flatten-time", default="14:50", help="CT time to close open paper trades (ETFs close 15:00)")
     lv.add_argument("--push-summary", action="store_true",
                     help="also send the 08:25 CT pre-session summary to your phone (daily 'still running' check)")
     rp = sub.add_parser("replay")
@@ -429,8 +443,19 @@ def main(argv=None) -> int:
     except Exception as exc:  # e.g. TWS not running
         print(f"Could not connect to the data feed: {exc}", file=sys.stderr)
         return 3
+    trader = None
+    if args.trade or args.live:
+        # All order code lives in fbt/trader.py behind the RiskManager; this module only watches.
+        from .trader import TradingError, build_paper_trader
+        try:
+            trader = build_paper_trader(cfg, symbols, feed_name=args.feed, live_flag=args.live,
+                                        flatten_time=args.flatten_time)
+        except TradingError as exc:
+            print(f"TRADING ERROR: {exc}", file=sys.stderr)
+            return 4
+        print("AUTO PAPER TRADING ON: signals become bracket orders in your Alpaca PAPER account.")
     runner = LiveRunner(Scanner(cfg, symbols), feed, AlertSink(log_path=args.log, push_summary=args.push_summary),
-                        history_days=args.history_days, stale_minutes=stale)
+                        history_days=args.history_days, stale_minutes=stale, trader=trader)
     print(f"Scanning {', '.join(runner.scanner.symbols)}; signals only {cfg['execution']['session']['start']}-"
           f"{cfg['execution']['session']['end']} CT. Ctrl+C to stop.")
     try:

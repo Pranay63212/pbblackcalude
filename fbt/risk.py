@@ -76,6 +76,20 @@ class RiskManager:
         self._outstanding: Set[int] = set()
         self.position_open = False
 
+    def use_costs(self, costs: CostModel) -> None:
+        """Size the next approval for another instrument while keeping ONE shared account
+        state (equity, daily limits, open position). Used when trading several markets."""
+        self.costs = costs
+        self.inst = costs.instrument
+
+    def set_equity(self, equity: float, reset_peak: bool = False) -> None:
+        """Sync equity from the broker account (e.g. at the start of a day).
+        `reset_peak` on the first sync, so the drawdown halt is measured from the real account."""
+        self.equity = float(equity)
+        self.peak = self.equity if reset_peak else max(self.peak, self.equity)
+        if self.day.trades == 0:
+            self.day.start_equity = self.equity
+
     # ------------------------------------------------------------------ day
     def new_day(self, date) -> None:
         if self.day.date != date:
@@ -161,9 +175,14 @@ class RiskManager:
 
     # ------------------------------------------------------------------ lifecycle
     def on_entry_filled(self, approval: Approval) -> None:
+        self.record_entry(approval.signal.key_level_id)
+
+    def record_entry(self, key_level_id: str) -> None:
+        """Count a filled entry against today's limits (also used when the fill is
+        reported later by a broker, after the single-use approval was consumed)."""
         self.position_open = True
         self.day.trades += 1
-        self.day.used_level_ids.add(approval.signal.key_level_id)
+        self.day.used_level_ids.add(key_level_id)
 
     def on_entry_cancelled(self, approval: Approval) -> None:
         # an unfilled limit does not count as a trade, but the level is used up

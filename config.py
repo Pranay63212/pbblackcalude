@@ -93,6 +93,9 @@ STRATEGY_CONFIG = {
     "stop_buffer_ticks": 1,             # stop placed 1 tick beyond the swing
     "limit_order_expiry_minutes": 30,   # for IFVG_LIMIT / CISD_LIMIT entries
     "alternative_entry_on_poor_rr": False,
+    # Optional market-agreement filter (NOT in the spec; off unless --pair-filter): trade only
+    # when the paired market (ES<->NQ, SPY<->QQQ) has the SAME higher-timeframe bias.
+    "require_pair_agreement": False,
     # Spec 4.5 exception: after one loss, a second trade only if the new setup
     # uses a different key level that was touched after the losing exit.
 }
@@ -107,6 +110,20 @@ RISK_CONFIG = {
     "min_stop_ticks": 4,         # reject unrealistically tight stops
     "max_daily_loss_pct": 2.0,   # stop for the day once realized loss reaches this
     "max_drawdown_halt_pct": 25.0,  # kill switch: halt all new trades
+    # Optional news filter (NOT in the spec; off unless --news-filter): no NEW entries from
+    # `minutes_before` to `minutes_after` around high-impact US releases. If the calendar does
+    # not cover today, new entries are refused rather than assuming a quiet day.
+    "news_filter": False,
+    "news_minutes_before": 15,
+    "news_minutes_after": 15,
+    "news_countries": ["USD"],
+    "news_impacts": ["High"],
+}
+
+SCANNER_CONFIG = {
+    # Pre-session mark-out time (CT): bias, draw on liquidity, key levels, previous day /
+    # overnight / previous week highs and lows, and today's high-impact news.
+    "premarket_time": "08:00",
 }
 
 BACKTEST_CONFIG = {
@@ -158,6 +175,7 @@ def default_config(daily_limits: str = "spec", session: str = "spec") -> dict:
         "strategy": copy.deepcopy(STRATEGY_CONFIG),
         "risk": copy.deepcopy(RISK_CONFIG),
         "backtest": copy.deepcopy(BACKTEST_CONFIG),
+        "scanner": copy.deepcopy(SCANNER_CONFIG),
     }
     cfg["execution"]["daily_limits"] = copy.deepcopy(DAILY_LIMIT_PROFILES[daily_limits])
     cfg["execution"]["session"].update(SESSION_PROFILES[session])

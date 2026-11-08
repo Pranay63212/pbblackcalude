@@ -260,6 +260,33 @@ Both `fbt.backtest` and `fbt.scanner` accept:
 Without flags, everything follows docs/STRATEGY.md. Each run records its profiles in
 `summary.json`.
 
+## News filter, market-agreement filter, morning mark-out
+
+```bash
+python -m fbt.econ --out data/econ_calendar.csv          # this week's events + all Fed meetings
+python -m fbt.scanner live --feed alpaca --trade --push-summary --news-filter --pair-filter
+python -m fbt.backtest ... --news-filter --news-file data/econ_calendar.csv --pair-filter --smt-data ...
+```
+
+- **Morning mark-out (08:00 CT, `--premarket-time`):** for each symbol, price, bias per
+  timeframe, paired-market bias, draw on liquidity, key levels, and the classic liquidity
+  levels: yesterday's high/low, the overnight (since 17:00 CT) high/low and last week's
+  high/low, each with its distance and whether it was already TAKEN. A separate message
+  lists today's high-impact US news. With `--push-summary` both go to your phone.
+- **`--news-filter` (not in the spec):** no new entries from 15 minutes before to 15 minutes
+  after a high-impact US release (Forex Factory weekly feed + Federal Reserve FOMC dates).
+  Most US data is released at 07:30 CT, before the 08:30 open, so the filter mainly affects
+  09:00 CT releases and the 13:00 CT Fed decision (extended session). If the calendar cannot
+  be downloaded for today, new entries are refused rather than assuming a quiet day. The
+  live scanner saves each week's calendar to `data/econ_calendar.csv`, building a history
+  for future backtests; until then, past news is known only for Fed meetings.
+- **`--pair-filter` (not in the spec):** SPY trades only when QQQ has the same bias and vice
+  versa (ES/NQ in backtests). If the paired market's data is missing, no trade. DIA, GLD,
+  YM and GC have no pair and are unaffected.
+- On ~29 days of Yahoo data neither filter could be judged: NQ's bias was neutral all
+  month (daily bullish vs 4H/1H bearish), so the pair filter blocked every ES trade, and no
+  trade fell inside a news window.
+
 ## Free real-data backtest (Yahoo Finance)
 
 ```bash

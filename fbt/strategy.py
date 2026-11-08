@@ -88,6 +88,7 @@ class PBBlakeStrategy:
         self.tracker = TouchTracker()
         self._bias_cache = {}
         self._setup: dict = {}
+        self._pair_cache: dict = {}
 
     # ------------------------------------------------------------------
     def _bias(self, view: MarketView, smt_view: Optional[MarketView]) -> dict:
@@ -101,6 +102,15 @@ class PBBlakeStrategy:
             self._bias_cache = {key: hit}  # only the latest is ever needed
         return dict(hit)
 
+    def _pair_bias(self, smt_view: MarketView) -> str:
+        tfs = list(self.cfg["bias_timeframes"].values())
+        key = ("pair",) + tuple(smt_view.count(tf) for tf in tfs)
+        hit = self._pair_cache.get(key)
+        if hit is None:
+            hit = determine_higher_timeframe_bias(smt_view, self.cfg, self.tick)["direction"]
+            self._pair_cache = {key: hit}
+        return hit
+
     # ------------------------------------------------------------------
     def evaluate(self, view: MarketView, smt_view: Optional[MarketView] = None,
                  context: Optional[TradeContext] = None) -> Decision:
@@ -113,6 +123,12 @@ class PBBlakeStrategy:
         detail = {"bias": bias}
         if direction == NEUTRAL:
             return Decision(now, "NO_TRADE", "BIAS_NEUTRAL", NEUTRAL, detail=detail)
+        # Optional market-agreement filter (not in the spec): the paired market must share the bias.
+        if self.cfg.get("require_pair_agreement") and smt_view is not None:
+            pair_dir = self._pair_bias(smt_view)
+            detail["pair_bias"] = pair_dir
+            if pair_dir != direction:
+                return Decision(now, "NO_TRADE", "PAIR_DISAGREES", direction, detail=detail)
         draw = identify_draw_on_liquidity(view, direction, self.cfg, self.tick)
         if draw is None:
             return Decision(now, "NO_TRADE", "NO_DRAW_ON_LIQUIDITY", direction, detail=detail)

@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 
 from .data import Bars, MarketView, NS_PER_MIN, timeframe_minutes
 from .indicators import (BEARISH, BULLISH, NEUTRAL, FVG, find_cisd, find_fvgs, find_rejection_block,
@@ -576,5 +577,40 @@ __all__ = [
     "TouchTracker", "timeframe_bias", "determine_higher_timeframe_bias", "identify_draw_on_liquidity",
     "KeyLevel", "identify_key_levels", "ManipulationLeg", "identify_manipulation_leg",
     "find_highest_timeframe_ifvg", "fvgs_within_leg", "ifvg_inversion_state", "liquidity_targets",
-    "select_target", "calculate_risk_reward", "smt_divergence", "unswept_swings",
+    "select_target", "calculate_risk_reward", "smt_divergence", "unswept_swings", "session_levels",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Pre-session mark-out (information for the trader; not used in decisions)
+# ---------------------------------------------------------------------------
+def session_levels(view: MarketView) -> dict:
+    """Classic liquidity levels from completed bars: previous day, current session so far
+    (overnight), previous week. `taken_*` = today's session already traded beyond it."""
+    from .data import ns_to_chicago
+    out = {"price": view.last_close}
+    d = view.bars("1d")
+    m1 = view.bars("1m")
+    # current session = since the most recent 17:00 CT (works even before any daily bar exists)
+    local_now = ns_to_chicago(view.now)
+    open_local = local_now.normalize() + pd.Timedelta(hours=17)
+    if local_now < open_local:
+        open_local -= pd.Timedelta(days=1)
+    j = int(np.searchsorted(m1.open_time, open_local.tz_convert("UTC").value, side="left"))
+    if j < len(m1):
+        out["overnight_high"], out["overnight_low"] = float(m1.high[j:].max()), float(m1.low[j:].min())
+    if len(d) == 0:
+        return out
+    out["prev_day_high"], out["prev_day_low"] = float(d.high[-1]), float(d.low[-1])
+    if "overnight_high" in out:
+        out["taken_prev_day_high"] = out["overnight_high"] > out["prev_day_high"]
+        out["taken_prev_day_low"] = out["overnight_low"] < out["prev_day_low"]
+    today = local_now.date()
+    monday = pd.Timestamp(today) - pd.Timedelta(days=pd.Timestamp(today).dayofweek)
+    prev_mon, prev_sun = (monday - pd.Timedelta(days=7)).date(), (monday - pd.Timedelta(days=1)).date()
+    dates = [ns_to_chicago(int(t)).date() for t in d.close_time]
+    idx = [k for k, dt in enumerate(dates) if prev_mon <= dt <= prev_sun]
+    if idx:
+        out["prev_week_high"] = float(d.high[idx].max())
+        out["prev_week_low"] = float(d.low[idx].min())
+    return out

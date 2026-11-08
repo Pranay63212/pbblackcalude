@@ -50,13 +50,13 @@ class BacktestResult:
 class Backtester:
     def __init__(self, data: MultiTimeframeData, config: dict, smt_data: Optional[MultiTimeframeData] = None,
                  costs: Optional[CostModel] = None, record_all_decisions: bool = False,
-                 strategy: Optional[PBBlakeStrategy] = None):
+                 strategy: Optional[PBBlakeStrategy] = None, calendar=None):
         self.data = data
         self.smt = smt_data
         self.cfg = config
         self.inst = get_instrument(data.symbol)
         self.costs = costs or CostModel.default(data.symbol)
-        self.risk = RiskManager(config, self.costs)
+        self.risk = RiskManager(config, self.costs, calendar)
         self.broker = PaperBroker(self.costs, self.risk, data.symbol)
         self.strategy = strategy or PBBlakeStrategy(config, self.inst)
         self.record_all = record_all_decisions
@@ -321,9 +321,31 @@ def main(argv=None) -> int:
                          "stop after 4 losses or the 2%% daily loss limit)")
     ap.add_argument("--session", choices=["spec", "extended"], default="spec",
                     help="spec = new entries 08:30-10:00 CT (default); extended = until 14:30 CT")
+    ap.add_argument("--pair-filter", action="store_true",
+                    help="only trade when the paired market (--smt-data) has the same bias")
+    ap.add_argument("--news-filter", action="store_true",
+                    help="no new entries around high-impact US releases listed in --news-file")
+    ap.add_argument("--news-file", default="data/econ_calendar.csv",
+                    help="economic calendar CSV (python -m fbt.econ); a backtest only knows the events in it")
     args = ap.parse_args(argv)
 
     cfg = default_config(args.daily_limits, args.session)
+    calendar = None
+    if args.pair_filter:
+        if not args.smt_data:
+            print("ERROR: --pair-filter needs the paired market's data via --smt-data.", file=sys.stderr)
+            return 2
+        cfg["strategy"]["require_pair_agreement"] = True
+    if args.news_filter:
+        from .econ import CalendarError, EconCalendar, load_csv
+        try:
+            calendar = EconCalendar(load_csv(args.news_file))  # coverage unknown: only listed events count
+        except CalendarError as exc:
+            print(f"CALENDAR ERROR: {exc}", file=sys.stderr)
+            return 2
+        cfg["risk"]["news_filter"] = True
+        print(f"News filter: {len(calendar.relevant())} high-impact US events from {args.news_file}. "
+              "Days missing from that file are treated as having no news.", file=sys.stderr)
     try:
         df = load_ohlcv(args.data, symbol=args.data_symbol, tz=args.tz, start=args.start, end=args.end)
         data = MultiTimeframeData(df, args.symbol, daily_history=load_daily(args.daily_data))
@@ -336,7 +358,7 @@ def main(argv=None) -> int:
         return 2
     report = data_quality_report(df)
     print(f"Loaded {report['bars']} bars {report['first']} -> {report['last']}", file=sys.stderr)
-    bt = Backtester(data, cfg, smt, record_all_decisions=args.all_decisions)
+    bt = Backtester(data, cfg, smt, record_all_decisions=args.all_decisions, calendar=calendar)
     res = bt.run(progress=True)
     res.data_report = report
     if args.oos_start:

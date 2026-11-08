@@ -56,8 +56,11 @@ class DayState:
 
 
 class RiskManager:
-    def __init__(self, config: dict, costs: CostModel):
+    def __init__(self, config: dict, costs: CostModel, calendar=None):
         self.risk = config["risk"]
+        self.calendar = calendar  # fbt.econ.EconCalendar, used only when risk["news_filter"] is on
+        if self.risk.get("news_filter") and calendar is None:
+            raise ValueError("news_filter is on but no economic calendar was given.")
         self.limits = config["execution"]["daily_limits"]
         sess = config["execution"]["session"]
         if sess["timezone"] != "America/Chicago":
@@ -117,6 +120,16 @@ class RiskManager:
             return "DAILY_LOSS_LIMIT"
         return None
 
+    def news_block(self, now_ns: int) -> Optional[str]:
+        """NEWS_BLACKOUT near a high-impact release; NEWS_CALENDAR_MISSING if today is not covered."""
+        if not self.risk.get("news_filter"):
+            return None
+        from .data import ns_to_chicago
+        if not self.calendar.covers(ns_to_chicago(now_ns).date()):
+            return "NEWS_CALENDAR_MISSING"
+        ev = self.calendar.in_blackout(now_ns, self.risk["news_minutes_before"], self.risk["news_minutes_after"])
+        return "NEWS_BLACKOUT" if ev is not None else None
+
     def trade_context(self) -> TradeContext:
         """What the strategy may still look for today."""
         d = self.day
@@ -142,6 +155,9 @@ class RiskManager:
             return Rejection("POSITION_ALREADY_OPEN")  # never add to a position
         if not self.in_session(local_minute):
             return Rejection("OUTSIDE_SESSION")
+        news = self.news_block(now_ns)
+        if news:
+            return Rejection(news)
         blocked = self.day_blocked_reason()
         if blocked:
             return Rejection(blocked)

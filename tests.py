@@ -1433,6 +1433,219 @@ class TestProfiles(unittest.TestCase):
             self.assertEqual(summ["config"]["profiles"], {"daily_limits": "relaxed", "session": "extended"})
 
 
+FF_SAMPLE = [
+    {"title": "CPI m/m", "country": "USD", "date": "2026-11-10T08:30:00-05:00", "impact": "High"},
+    {"title": "ISM Services PMI", "country": "USD", "date": "2026-11-12T10:00:00-05:00", "impact": "High"},
+    {"title": "Retail Sales", "country": "GBP", "date": "2026-11-12T02:00:00-05:00", "impact": "High"},
+    {"title": "Crude Oil Inventories", "country": "USD", "date": "2026-11-12T10:30:00-05:00", "impact": "Medium"},
+]
+FOMC_SAMPLE = ('<h4>2026 FOMC Meetings</h4>'
+               '<div class="fomc-meeting__month"><strong>October</strong></div><div class="fomc-meeting__date">27-28</div>'
+               '<div class="fomc-meeting__month"><strong>Dec</strong></div><div class="fomc-meeting__date">8-9*</div>'
+               '<h4>2025 FOMC Meetings</h4>'
+               '<div class="fomc-meeting__month"><strong>Apr/May</strong></div><div class="fomc-meeting__date">30-1</div>')
+
+
+class TestNewsCalendar(unittest.TestCase):
+    def test_faireconomy_parse_and_week_coverage(self):
+        from fbt.econ import EconCalendar, parse_faireconomy
+        import datetime as dt
+        events, days = parse_faireconomy(FF_SAMPLE)
+        self.assertEqual(len(events), 4)
+        self.assertEqual(min(days), dt.date(2026, 11, 8))   # Sunday..Saturday of that week
+        self.assertEqual(max(days), dt.date(2026, 11, 14))
+        cal = EconCalendar(events, days)
+        rel = cal.relevant()                                # USD + High only
+        self.assertEqual([e.title for e in rel], ["CPI m/m", "ISM Services PMI"])
+        self.assertEqual(rel[0].local.strftime("%H:%M"), "07:30")
+        self.assertEqual(rel[1].local.strftime("%H:%M"), "09:00")
+        self.assertTrue(cal.covers(dt.date(2026, 11, 12)))
+        self.assertFalse(cal.covers(dt.date(2026, 11, 16)))
+        self.assertTrue(EconCalendar(events).covers(dt.date(2030, 1, 1)))  # coverage unknown (backtests)
+
+    def test_fomc_parse(self):
+        from fbt.econ import parse_fomc_html
+        ev = parse_fomc_html(FOMC_SAMPLE)
+        local = [(e.local.strftime("%Y-%m-%d %H:%M"), e.title) for e in ev]
+        self.assertIn(("2026-10-28 13:00", "FOMC Statement"), local)
+        self.assertIn(("2026-10-28 13:30", "FOMC Press Conference"), local)
+        self.assertIn(("2026-12-09 13:00", "FOMC Statement"), local)
+        self.assertIn(("2025-05-01 13:00", "FOMC Statement"), local)   # meeting spanning two months
+
+    def test_blackout_window_edges(self):
+        from fbt.econ import EconCalendar, parse_faireconomy
+        cal = EconCalendar(*parse_faireconomy(FF_SAMPLE))
+        self.assertIsNone(cal.in_blackout(ns("2026-11-12 08:44"), 15, 15))
+        self.assertEqual(cal.in_blackout(ns("2026-11-12 08:45"), 15, 15).title, "ISM Services PMI")
+        self.assertIsNotNone(cal.in_blackout(ns("2026-11-12 09:15"), 15, 15))
+        self.assertIsNone(cal.in_blackout(ns("2026-11-12 09:16"), 15, 15))
+        self.assertIsNone(cal.in_blackout(ns("2026-11-12 09:30"), 15, 15))  # medium impact ignored
+
+    def test_csv_roundtrip_and_refresh_with_fake_download(self):
+        import json
+        from fbt.econ import CalendarError, EconCalendar, FF_URL, FOMC_URL, load_csv, refresh_calendar
+        pages = {FF_URL: json.dumps(FF_SAMPLE), FOMC_URL: FOMC_SAMPLE}
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "cal.csv")
+            cal = EconCalendar(covered_days=set())
+            refresh_calendar(cal, path, http=lambda u: pages[u])
+            again = load_csv(path)
+            self.assertEqual(len(again), len(cal.events))
+            refresh_calendar(cal, path, http=lambda u: pages[u])     # no duplicates on refresh
+            self.assertEqual(len(load_csv(path)), len(again))
+            with self.assertRaises(CalendarError):
+                refresh_calendar(EconCalendar(), None, http=lambda u: "not json")
+            with self.assertRaises(CalendarError):
+                load_csv(os.path.join(d, "missing.csv"))
+
+    def _rm(self, calendar, on=True):
+        cfg = default_config()
+        cfg["risk"]["news_filter"] = on
+        rm = RiskManager(cfg, CostModel.default("ES"), calendar)
+        rm.new_day("2026-11-12")
+        return rm
+
+    def test_risk_manager_news_blackout(self):
+        from fbt.econ import EconCalendar, parse_faireconomy
+        cal = EconCalendar(*parse_faireconomy(FF_SAMPLE))
+        t = ns("2026-11-12 09:05")
+        self.assertEqual(self._rm(cal).approve(make_signal(t=t), t, 545, False).reason, "NEWS_BLACKOUT")
+        t2 = ns("2026-11-12 09:20")
+        self.assertIsInstance(self._rm(cal).approve(make_signal(t=t2), t2, 560, False), Approval)
+        self.assertIsInstance(self._rm(cal, on=False).approve(make_signal(t=t), t, 545, False), Approval)
+        t3 = ns("2026-11-17 09:05")  # a day the calendar does not cover -> refuse, don't assume quiet
+        self.assertEqual(self._rm(cal).approve(make_signal(t=t3), t3, 545, False).reason, "NEWS_CALENDAR_MISSING")
+        cfg = default_config()
+        cfg["risk"]["news_filter"] = True
+        with self.assertRaises(ValueError):
+            RiskManager(cfg, CostModel.default("ES"))
+
+    def test_paper_trader_respects_news_pause(self):
+        from fbt.econ import EconCalendar, parse_faireconomy
+        from fbt.trader import AlpacaPaperBroker, PaperTrader
+        events, _ = parse_faireconomy(FF_SAMPLE)
+        cfg = default_config()
+        cfg["risk"]["news_filter"] = True
+        today = pd.Timestamp.now(tz=CT).normalize()
+        moved = [type(e)(int((today + pd.Timedelta(hours=9)).tz_convert("UTC").value), e.title, e.country, e.impact)
+                 for e in events if e.title == "ISM Services PMI"]
+        cal = EconCalendar(moved, {today.date()})
+        api = FakeAlpacaTrading()
+        tr = PaperTrader(cfg, lambda rm: AlpacaPaperBroker(rm, http=api, env=TestPaperTrader.KEYS), ["SPY"],
+                         state_path=None, trades_log=None, calendar=cal)
+        t = int((today + pd.Timedelta(hours=9, minutes=5)).tz_convert("UTC").value)
+        sig = make_signal(t=t, touch=t - NS_PER_MIN)
+        ev = tr.on_minute(pd.Timestamp(t, tz="UTC") + pd.Timedelta(seconds=3),
+                          [ScanEvent(t, "SPY", "SIGNAL", "s", {"signal": sig.to_dict()})])
+        self.assertIn("NEWS_BLACKOUT", ev[-1].text)
+        self.assertEqual(api.posts(), [])
+
+    def test_backtest_cli_news_and_pair_flags(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "m.csv")
+            random_walk_df(days=3, seed=2).to_csv(p, index_label="timestamp")
+            out = os.path.join(d, "out")
+            self.assertEqual(cli_main(["--data", p, "--symbol", "ES", "--out", out, "--pair-filter"]), 2)
+            self.assertEqual(cli_main(["--data", p, "--symbol", "ES", "--out", out, "--news-filter",
+                                       "--news-file", os.path.join(d, "none.csv")]), 2)
+
+
+class TestPairFilterAndMarkOut(unittest.TestCase):
+    def setUp(self):
+        self.cfg = scenario_config()
+        self.cfg["strategy"]["require_pair_agreement"] = True
+        self.data = MultiTimeframeData(bullish_scenario_df(), "ES")
+        self.t = ns("2024-03-12 09:00")
+
+    def _decide(self, pair_dir):
+        st = FixedBiasStrategy(self.cfg, ES, BULLISH)
+        st._pair_bias = lambda v: pair_dir
+        return st.evaluate(self.data.view(self.t), self.data.view(self.t))
+
+    def test_pair_must_agree(self):
+        d = self._decide(BEARISH)
+        self.assertEqual((d.status, d.reason), ("NO_TRADE", "PAIR_DISAGREES"))
+        self.assertEqual(self._decide(NEUTRAL).reason, "PAIR_DISAGREES")
+        d = self._decide(BULLISH)
+        self.assertEqual(d.status, "SIGNAL")
+        self.assertEqual(d.detail["pair_bias"], BULLISH)
+        off = FixedBiasStrategy(scenario_config(), ES, BULLISH)       # default: filter off
+        off._pair_bias = lambda v: BEARISH
+        self.assertEqual(off.evaluate(self.data.view(self.t), self.data.view(self.t)).status, "SIGNAL")
+
+    def test_scanner_blocks_when_expected_pair_has_no_data(self):
+        sc = Scanner(self.cfg, ["ES", "NQ"], strategy_factory=lambda s: FixedBiasStrategy(self.cfg, ES, BULLISH))
+        d = sc.evaluate("ES", {"ES": self.data}, self.t)
+        self.assertEqual(d.reason, "PAIR_DATA_MISSING")
+
+    def test_session_levels(self):
+        from fbt.structure import session_levels
+        df = random_walk_df(days=8, seed=5, start="2023-01-02")
+        data = MultiTimeframeData(df, "ES")
+        now = ns("2023-01-11 08:00")
+        lv = session_levels(data.view(now))
+        loc = df.tz_convert(CT)
+        prev = loc.loc["2023-01-09 17:00":"2023-01-10 15:59"]       # Tue Jan 10 session
+        self.assertEqual((lv["prev_day_high"], lv["prev_day_low"]), (prev.high.max(), prev.low.min()))
+        on = loc.loc["2023-01-10 17:00":"2023-01-11 07:59"]
+        self.assertEqual((lv["overnight_high"], lv["overnight_low"]), (on.high.max(), on.low.min()))
+        wk = loc.loc["2023-01-01 17:00":"2023-01-06 15:59"]          # Mon Jan 2 - Fri Jan 6 sessions
+        self.assertEqual((lv["prev_week_high"], lv["prev_week_low"]), (wk.high.max(), wk.low.min()))
+        self.assertEqual(lv["taken_prev_day_high"], on.high.max() > prev.high.max())
+
+    def test_premarket_mark_out_and_news_message(self):
+        from fbt.econ import EconCalendar, EconEvent
+        cfg = scenario_config()
+        cfg["risk"]["news_filter"] = True
+        ev = EconEvent(ns("2024-03-12 09:00"), "ISM Services PMI", "USD", "High")
+        cal = EconCalendar([ev], covered_days=set())
+        sc = Scanner(cfg, ["ES"], strategy_factory=lambda s: FixedBiasStrategy(cfg, ES, BULLISH), calendar=cal)
+        events = replay_day(sc, {"ES": self.data}, "2024-03-12")
+        pre = [e for e in events if e.kind == "PREMARKET"]
+        news = [e for e in events if e.kind == "NEWS"]
+        self.assertEqual(len(pre), 1)
+        self.assertEqual(ns_to_chicago(pre[0].time).strftime("%H:%M"), "08:00")
+        self.assertIn("Overnight: high", pre[0].text)
+        self.assertEqual(len(news), 1)
+        self.assertIn("09:00 CT  ISM Services PMI", news[0].text)
+        self.assertIn("no new trades 08:45-09:15", news[0].text)
+        sig = [e for e in events if e.kind == "SIGNAL"]
+        self.assertIn("NEWS PAUSE", sig[0].text)                      # 09:00 signal falls in the pause
+        sent = []
+        AlertSink(webhook="https://example.invalid/h", send=lambda u, t: sent.append(t), echo=lambda t: None,
+                  push_summary=True).emit(news[0])
+        self.assertEqual(len(sent), 1)
+
+    def test_calendar_download_failure_reported_and_entries_refused(self):
+        from fbt.econ import CalendarError, EconCalendar
+        from fbt.trader import AlpacaPaperBroker, PaperTrader
+        cfg = default_config()
+        cfg["risk"]["news_filter"] = True
+        cal = EconCalendar(covered_days=set())
+        api = FakeAlpacaTrading()
+        trader = PaperTrader(cfg, lambda rm: AlpacaPaperBroker(rm, http=api, env=TestPaperTrader.KEYS), ["SPY"],
+                             state_path=None, trades_log=None, calendar=cal)
+        out = []
+        sink = AlertSink(webhook="", echo=lambda t: None)
+        sink.emit = lambda e: out.append(e)
+        today = pd.Timestamp.now(tz=CT).normalize()
+        box = [(today + pd.Timedelta(hours=9, minutes=5, seconds=3)).tz_convert("UTC")]
+        feed = ReplayFeed({"SPY": bullish_scenario_df()})
+        feed.now = box[0]
+
+        def boom():
+            raise CalendarError("could not download")
+        runner = LiveRunner(Scanner(cfg, ["SPY"], calendar=cal), feed, sink, clock=lambda: box[0], trader=trader,
+                            calendar_refresh=boom)
+        runner._refresh_calendar(box[0])
+        self.assertIn("News calendar unavailable", out[-1].text)
+        t = int(box[0].floor("min").value)
+        ev = trader.on_minute(box[0], [ScanEvent(t, "SPY", "SIGNAL", "s",
+                                                 {"signal": make_signal(t=t, touch=t - NS_PER_MIN).to_dict()})])
+        self.assertIn("NEWS_CALENDAR_MISSING", ev[-1].text)
+        self.assertEqual(api.posts(), [])
+
+
 class FakeAlpacaTrading:
     """Stand-in for Alpaca's paper Trading API. Records every call."""
 

@@ -41,6 +41,7 @@ from .data import CHICAGO, DataError, MultiTimeframeData, load_ohlcv, ns_to_chic
 from .feeds import completed_only, merge_bars, minutes_since_last_bar
 from .risk import RiskManager
 from .strategy import Decision, PBBlakeStrategy
+from .structure import session_levels
 
 MICRO = {"ES": "MES", "NQ": "MNQ", "YM": "MYM", "GC": "MGC"}
 DISCLAIMER = ("Alerts show setups that FIT the written rules. They are not predictions and not advice. "
@@ -92,6 +93,8 @@ def format_levels(d: Decision, tick) -> List[str]:
 
 def sizing_lines(signal, symbol: str, config: dict) -> List[str]:
     lines = []
+    # display only: sizing never depends on the news calendar
+    config = {**config, "risk": {**config["risk"], "news_filter": False}}
     for sym in (symbol, MICRO.get(symbol)):
         if not sym:
             continue
@@ -141,16 +144,59 @@ def format_forming(symbol: str, d: Decision) -> str:
     return f"{symbol} setup forming {_hm(d.time)} CT: {d.bias_direction}, price in key level; {what}."
 
 
-def format_premarket(symbol: str, d: Decision) -> str:
+def format_levels_block(symbol: str, lv: dict) -> List[str]:
     tick = get_instrument(symbol).tick_size
-    lines = [f"{symbol} pre-session {_hm(d.time)} CT: bias {format_bias(d)}"]
+    price = lv.get("price")
+
+    def one(name, key, taken_key=None):
+        if key not in lv:
+            return None
+        diff = lv[key] - price
+        txt = f"{name} {_px(lv[key], tick)} ({'+' if diff >= 0 else ''}{_px(diff, tick)})"
+        if taken_key and lv.get(taken_key):
+            txt += " TAKEN"
+        return txt
+    rows = [
+        ("Yesterday", one("high", "prev_day_high", "taken_prev_day_high"), one("low", "prev_day_low", "taken_prev_day_low")),
+        ("Overnight", one("high", "overnight_high"), one("low", "overnight_low")),
+        ("Last week", one("high", "prev_week_high"), one("low", "prev_week_low")),
+    ]
+    return [f"  {label}: {a} | {b}" for label, a, b in rows if a and b]
+
+
+def format_premarket(symbol: str, d: Decision, levels: Optional[dict] = None) -> str:
+    tick = get_instrument(symbol).tick_size
+    head = f"{symbol} pre-session {_hm(d.time)} CT"
+    if levels and "price" in levels:
+        head += f", price {_px(levels['price'], tick)}"
+    lines = [head, f"  Bias {format_bias(d)}"]
+    pb = d.detail.get("pair_bias")
+    if pb:
+        lines.append(f"  Paired market bias: {pb}{' (agrees)' if pb == d.bias_direction else ' (DISAGREES: no trades)'}")
     draw = d.detail.get("draw")
     if draw:
-        lines.append(f"  draw on liquidity {_px(draw['price'], tick)} {draw['liquidity_type']} ({draw['kind']})")
+        lines.append(f"  Draw on liquidity {_px(draw['price'], tick)} {draw['liquidity_type']} ({draw['kind']})")
+    if levels:
+        lines += format_levels_block(symbol, levels)
     lv = format_levels(d, tick)
-    lines += [f"  key level: {x}" for x in lv] or ["  no key levels yet"]
+    lines += [f"  Key level: {x}" for x in lv] or ["  No key levels yet"]
     if d.status == "NO_TRADE":
-        lines.append(f"  -> no trade conditions: {d.reason}")
+        lines.append(f"  -> no trade conditions now: {d.reason}")
+    return "\n".join(lines)
+
+
+def format_news(day, events, cfg: dict) -> str:
+    risk = cfg["risk"]
+    if not events:
+        return f"US high-impact news today ({day}): none listed."
+    lines = [f"US high-impact news today ({day}):"]
+    for e in events:
+        line = f"  {e.local:%H:%M} CT  {e.title}"
+        if risk.get("news_filter"):
+            a = e.local - pd.Timedelta(minutes=risk["news_minutes_before"])
+            b = e.local + pd.Timedelta(minutes=risk["news_minutes_after"])
+            line += f"   (no new trades {a:%H:%M}-{b:%H:%M})"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -161,8 +207,11 @@ class Scanner:
     """Evaluates symbols at a point in time and turns decisions into events."""
 
     def __init__(self, config: dict, symbols: List[str],
-                 strategy_factory: Optional[Callable[[str], PBBlakeStrategy]] = None):
+                 strategy_factory: Optional[Callable[[str], PBBlakeStrategy]] = None, calendar=None):
         self.cfg = config
+        self.calendar = calendar  # fbt.econ.EconCalendar or None
+        self.premarket = parse_hhmm(config.get("scanner", {}).get("premarket_time", "08:00"))
+        self._news_done = None
         self.symbols = [get_instrument(s).symbol for s in symbols]
         self.factory = strategy_factory or (lambda sym: PBBlakeStrategy(config, get_instrument(sym)))
         sess = config["execution"]["session"]
@@ -173,10 +222,16 @@ class Scanner:
         self._alerted: set = set()
 
     def active(self, now_ns: int) -> bool:
-        """Minutes when the scanner does work: 5 minutes before the session through its end."""
+        """Minutes when the scanner does work: from the pre-session mark-out through the session end."""
         t = ns_to_chicago(now_ns)
         m = t.hour * 60 + t.minute
-        return self.start - 5 <= m <= self.end
+        return min(self.premarket, self.start) <= m <= self.end
+
+    def _news_event(self, now_ns: int):
+        r = self.cfg["risk"]
+        if self.calendar is None or not r.get("news_filter"):
+            return None
+        return self.calendar.in_blackout(now_ns, r["news_minutes_before"], r["news_minutes_after"])
 
     def in_session(self, now_ns: int) -> bool:
         t = ns_to_chicago(now_ns)
@@ -186,21 +241,31 @@ class Scanner:
     def evaluate(self, symbol: str, data: Dict[str, MultiTimeframeData], now_ns: int) -> Decision:
         view = data[symbol].view(now_ns)
         pair = SMT_PAIRS.get(symbol)
-        smt_view = data[pair].view(now_ns) if pair in data and self.cfg["strategy"].get("smt_enabled") else None
+        need_pair = self.cfg["strategy"].get("require_pair_agreement") and pair in self.symbols
+        if need_pair and pair not in data:
+            # the paired market is expected but has no usable data this minute: do not trade blind
+            return Decision(now_ns, "NO_TRADE", "PAIR_DATA_MISSING")
+        use_pair = pair in data and (self.cfg["strategy"].get("smt_enabled") or need_pair)
+        smt_view = data[pair].view(now_ns) if use_pair else None
         return self.factory(symbol).evaluate(view, smt_view)
 
     def scan(self, data: Dict[str, MultiTimeframeData], now_ns: int) -> List[ScanEvent]:
         events: List[ScanEvent] = []
         local = ns_to_chicago(now_ns)
         minute = local.hour * 60 + local.minute
-        premarket_at = self.start - 5
+        pre_window = self.premarket <= minute < max(self.start, self.premarket + 1)
+        if pre_window and self.calendar is not None and self._news_done != local.date():
+            self._news_done = local.date()
+            events.append(ScanEvent(now_ns, "-", "NEWS", format_news(local.date(), self.calendar.on_day(local.date()),
+                                                                     self.cfg)))
         for sym in self.symbols:
             if sym not in data:
                 continue
-            if premarket_at <= minute < self.start and self._premarket_done.get(sym) != local.date():
+            if pre_window and self._premarket_done.get(sym) != local.date():
                 d = self.evaluate(sym, data, now_ns)
                 self._premarket_done[sym] = local.date()
-                events.append(ScanEvent(now_ns, sym, "PREMARKET", format_premarket(sym, d)))
+                levels = session_levels(data[sym].view(now_ns))
+                events.append(ScanEvent(now_ns, sym, "PREMARKET", format_premarket(sym, d, levels)))
             if not self.in_session(now_ns):
                 continue
             d = self.evaluate(sym, data, now_ns)
@@ -208,8 +273,11 @@ class Scanner:
                 key = (sym, d.signal.key_level_id, d.time)
                 if key not in self._alerted:
                     self._alerted.add(key)
-                    events.append(ScanEvent(now_ns, sym, "SIGNAL", format_signal(sym, d, self.cfg),
-                                            {"signal": d.signal.to_dict()}))
+                    text = format_signal(sym, d, self.cfg)
+                    ev_news = self._news_event(now_ns)
+                    if ev_news is not None:
+                        text += f"\nNEWS PAUSE: {ev_news.title} at {ev_news.local:%H:%M} CT - no new trade."
+                    events.append(ScanEvent(now_ns, sym, "SIGNAL", text, {"signal": d.signal.to_dict()}))
             elif d.reason.startswith("WAITING_IFVG") and self._last_reason.get(sym) != d.reason:
                 events.append(ScanEvent(now_ns, sym, "SETUP_FORMING", format_forming(sym, d)))
             self._last_reason[sym] = d.reason
@@ -221,11 +289,12 @@ class Scanner:
 # ---------------------------------------------------------------------------
 class AlertSink:
     PUSH_KINDS = ("SIGNAL", "SETUP_FORMING", "STALE", "DATA_ERROR", "ORDER", "FILL", "EXIT", "ORDER_ERROR", "SKIPPED")
+    SUMMARY_KINDS = ("PREMARKET", "NEWS", "HEARTBEAT")
 
     def __init__(self, log_path: Optional[str] = None, webhook: Optional[str] = None,
                  send: Optional[Callable[[str, str], None]] = None, echo: Callable[[str], None] = print,
                  push_summary: bool = False):
-        self.push_kinds = self.PUSH_KINDS + (("PREMARKET", "HEARTBEAT") if push_summary else ())
+        self.push_kinds = self.PUSH_KINDS + (self.SUMMARY_KINDS if push_summary else ())
         self.log_path = log_path
         self.webhook = webhook if webhook is not None else os.environ.get("FBT_ALERT_WEBHOOK")
         self.send = send or _post_webhook
@@ -264,8 +333,10 @@ class LiveRunner:
 
     def __init__(self, scanner: Scanner, feed, sink: AlertSink, history_days: int = 20,
                  stale_minutes: float = 3.0, clock: Callable[[], pd.Timestamp] = lambda: pd.Timestamp.now(tz="UTC"),
-                 trader=None):
+                 trader=None, calendar_refresh: Optional[Callable[[], int]] = None):
         self.trader = trader  # optional PaperTrader (paper orders through the RiskManager)
+        self.calendar_refresh = calendar_refresh  # downloads/merges the economic calendar
+        self._cal_day = None
         self.scanner = scanner
         self.feed = feed
         self.sink = sink
@@ -290,8 +361,20 @@ class LiveRunner:
                                      f"{sym} DATA ERROR loading history (will retry): {_describe(exc)}"))
             return False
 
+    def _refresh_calendar(self, now: pd.Timestamp) -> None:
+        day = now.tz_convert("America/Chicago").date()
+        if self.calendar_refresh is None or self._cal_day == day:
+            return
+        try:
+            self.calendar_refresh()
+            self._cal_day = day
+        except Exception as exc:  # the news filter then refuses entries (calendar does not cover today)
+            self.sink.emit(ScanEvent(int(now.value), "-", "DATA_ERROR",
+                                     f"News calendar unavailable (will retry): {_describe(exc)}"))
+
     def warm_up(self) -> None:
         now = self.clock()
+        self._refresh_calendar(now)
         for sym in self.scanner.symbols:
             self._warm_symbol(sym, now)
 
@@ -309,6 +392,8 @@ class LiveRunner:
         data: Dict[str, MultiTimeframeData] = {}
         events: List[ScanEvent] = []
         active = self.scanner.active(now_ns)
+        if active:
+            self._refresh_calendar(now)
         for sym in self.scanner.symbols:
             if sym not in self._warmed and not self._warm_symbol(sym, now):
                 continue
@@ -395,6 +480,13 @@ def main(argv=None) -> int:
     lv.add_argument("--client-id", type=int, default=17)
     lv.add_argument("--history-days", type=int, default=20)
     lv.add_argument("--log", default="results/alerts.csv")
+    lv.add_argument("--news-filter", action="store_true",
+                    help="no new trades 15 min before/after high-impact US releases (calendar refreshed daily)")
+    lv.add_argument("--news-file", default="data/econ_calendar.csv",
+                    help="where the economic calendar is cached (builds history for backtests)")
+    lv.add_argument("--pair-filter", action="store_true",
+                    help="only trade SPY when QQQ has the same bias and vice versa (ES<->NQ for futures)")
+    lv.add_argument("--premarket-time", default=None, help="CT time of the morning mark-out (default 08:00)")
     lv.add_argument("--trade", action="store_true",
                     help="auto PAPER trade signals on Alpaca with bracket orders (entry + stop-loss + target)")
     lv.add_argument("--live", action="store_true", help="refused: live trading is not implemented")
@@ -433,7 +525,20 @@ def main(argv=None) -> int:
         return 0
 
     from .feeds import AlpacaFeed, CSVFolderFeed, IBKRFeed
+    from .econ import EconCalendar, refresh_calendar
     symbols = args.symbols or (list(ETFS) if args.feed == "alpaca" else ["ES", "NQ", "YM", "GC"])
+    roots = [get_instrument(s).symbol for s in symbols]
+    if args.premarket_time:
+        cfg["scanner"]["premarket_time"] = args.premarket_time
+    if args.pair_filter:
+        if not any(SMT_PAIRS.get(r) in roots for r in roots):
+            print("ERROR: --pair-filter needs both markets of a pair in --symbols (SPY+QQQ or ES+NQ).",
+                  file=sys.stderr)
+            return 2
+        cfg["strategy"]["require_pair_agreement"] = True
+    cfg["risk"]["news_filter"] = bool(args.news_filter)
+    calendar = EconCalendar(covered_days=set())  # nothing counts as covered until downloaded
+    news_file = args.news_file
     stale = args.stale_minutes or (5.0 if args.feed == "alpaca" else 3.0)
     try:
         if args.feed == "csv":
@@ -454,13 +559,19 @@ def main(argv=None) -> int:
         from .trader import TradingError, build_paper_trader
         try:
             trader = build_paper_trader(cfg, symbols, feed_name=args.feed, live_flag=args.live,
-                                        flatten_time=args.flatten_time)
+                                        flatten_time=args.flatten_time, calendar=calendar)
         except TradingError as exc:
             print(f"TRADING ERROR: {exc}", file=sys.stderr)
             return 4
         print("AUTO PAPER TRADING ON: signals become bracket orders in your Alpaca PAPER account.")
-    runner = LiveRunner(Scanner(cfg, symbols), feed, AlertSink(log_path=args.log, push_summary=args.push_summary),
-                        history_days=args.history_days, stale_minutes=stale, trader=trader)
+    runner = LiveRunner(Scanner(cfg, symbols, calendar=calendar), feed,
+                        AlertSink(log_path=args.log, push_summary=args.push_summary),
+                        history_days=args.history_days, stale_minutes=stale, trader=trader,
+                        calendar_refresh=lambda: refresh_calendar(calendar, news_file))
+    if args.news_filter:
+        print("NEWS FILTER ON: no new trades 15 min before/after high-impact US releases.")
+    if args.pair_filter:
+        print("PAIR FILTER ON: SPY/QQQ (ES/NQ) only trade when both have the same bias.")
     print(f"Scanning {', '.join(runner.scanner.symbols)}; signals only {cfg['execution']['session']['start']}-"
           f"{cfg['execution']['session']['end']} CT. Ctrl+C to stop.")
     try:

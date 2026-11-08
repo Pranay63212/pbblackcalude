@@ -167,10 +167,11 @@ class TradeEvent:
 class PaperTrader:
     def __init__(self, config: dict, broker_factory: Callable[[RiskManager], AlpacaPaperBroker],
                  symbols: List[str], state_path: Optional[str] = "results/trader_state.json",
-                 trades_log: Optional[str] = "results/paper_trades.csv", flatten_time: str = "14:50"):
+                 trades_log: Optional[str] = "results/paper_trades.csv", flatten_time: str = "14:50",
+                 calendar=None):
         self.cfg = config
         self.symbols = [get_instrument(s).symbol for s in symbols]
-        self.risk = RiskManager(config, CostModel.default(self.symbols[0]))
+        self.risk = RiskManager(config, CostModel.default(self.symbols[0]), calendar)
         self.broker = broker_factory(self.risk)
         self.state_path = state_path
         self.trades_log = trades_log
@@ -342,7 +343,7 @@ class PaperTrader:
 
 
 def build_paper_trader(config: dict, symbols: List[str], feed_name: str, live_flag: bool = False,
-                       flatten_time: str = "14:50", env=None) -> "PaperTrader":
+                       flatten_time: str = "14:50", env=None, calendar=None) -> "PaperTrader":
     """Validate the request and build the paper trader (used by `fbt.scanner live --trade`)."""
     resolve_trading_mode(live_flag, env)
     if feed_name != "alpaca":
@@ -350,7 +351,8 @@ def build_paper_trader(config: dict, symbols: List[str], feed_name: str, live_fl
     bad = [s for s in symbols if get_instrument(s).unit != "share"]
     if bad:
         raise TradingError(f"Alpaca cannot trade futures {bad}; use SPY QQQ DIA GLD.")
-    return PaperTrader(config, lambda rm: AlpacaPaperBroker(rm, env=env), symbols, flatten_time=flatten_time)
+    return PaperTrader(config, lambda rm: AlpacaPaperBroker(rm, env=env), symbols, flatten_time=flatten_time,
+                       calendar=calendar)
 
 
 __all__ = ["PaperTrader", "AlpacaPaperBroker", "build_paper_trader", "resolve_trading_mode", "TradingError", "TradeEvent", "PAPER_URL"]

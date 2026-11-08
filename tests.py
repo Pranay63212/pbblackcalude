@@ -1646,6 +1646,72 @@ class TestPairFilterAndMarkOut(unittest.TestCase):
         self.assertEqual(api.posts(), [])
 
 
+class TestWeekendsAndAlertDiagnostics(unittest.TestCase):
+    def test_weekend_is_quiet(self):
+        cfg = scenario_config()
+        df = bullish_scenario_df()
+        sc = Scanner(cfg, ["ES"], strategy_factory=lambda s: FixedBiasStrategy(cfg, ES, BULLISH))
+        data = {"ES": MultiTimeframeData(df, "ES")}
+        sunday = ns("2024-03-10 08:25")   # 2024-03-10 is a Sunday
+        self.assertFalse(sc.active(sunday))
+        self.assertFalse(sc.in_session(ns("2024-03-10 09:00")))
+        self.assertEqual(sc.scan(data, sunday), [])
+        self.assertTrue(sc.active(ns("2024-03-12 08:25")))   # Tuesday
+
+    def test_no_false_stale_alarm_on_sunday(self):
+        cfg = scenario_config()
+        df = bullish_scenario_df()
+        feed = ReplayFeed({"ES": df[df.index < ct("2024-03-08 15:00").tz_convert("UTC")]
+                           if (df.index < ct("2024-03-08 15:00").tz_convert("UTC")).any() else df.iloc[:100]})
+        box = [ct("2024-03-17 08:31:03").tz_convert("UTC")]  # a Sunday, data days old
+        feed.now = box[0]
+        out = []
+        sink = AlertSink(webhook="", echo=lambda t: None)
+        sink.emit = lambda e: out.append(e)
+        runner = LiveRunner(_fixed_scanner(cfg), feed, sink, clock=lambda: box[0])
+        runner.warm_up()
+        out.clear()
+        self.assertEqual(runner.step(), [])
+        self.assertEqual(out, [])
+
+    def test_webhook_error_reasons_are_plain_and_hide_the_channel(self):
+        import urllib.error
+        from fbt.scanner import webhook_error
+        dns = webhook_error(urllib.error.URLError(OSError(11001, "getaddrinfo failed")))
+        self.assertIn("ntfy.sh", dns)
+        self.assertIn("n-t-f-y", dns)
+        http = webhook_error(urllib.error.HTTPError("https://ntfy.sh/secret-topic", 429, "Too Many", {}, None))
+        self.assertIn("429", http)
+        self.assertNotIn("secret-topic", http)
+        self.assertIn("https://", webhook_error(ValueError("unknown url type: 'ntfy.sh/x'")))
+
+    def test_send_test_alert(self):
+        from fbt.scanner import send_test_alert
+        import urllib.error
+        msgs, sent = [], []
+        self.assertEqual(send_test_alert(env={}, echo=msgs.append), 2)
+        self.assertIn("not set", msgs[-1])
+        self.assertEqual(send_test_alert(env={"FBT_ALERT_WEBHOOK": "https://ntfy.sh/x"},
+                                         send=lambda u, t: sent.append((u, t)), echo=msgs.append), 0)
+        self.assertEqual(sent[0][0], "https://ntfy.sh/x")
+        self.assertIn("Test alert sent", msgs[-1])
+
+        def dns_fail(u, t):
+            raise urllib.error.URLError(OSError(11001, "getaddrinfo failed"))
+        self.assertEqual(send_test_alert(env={"FBT_ALERT_WEBHOOK": "https://nfty.sh/x"}, send=dns_fail,
+                                         echo=msgs.append), 1)
+        self.assertIn("FAILED", msgs[-1])
+        self.assertIn("n-t-f-y", msgs[-1])
+
+    def test_test_alert_command_line(self):
+        saved = os.environ.pop("FBT_ALERT_WEBHOOK", None)
+        try:
+            self.assertEqual(scanner_mod.main(["test-alert"]), 2)   # runs as typed; not set -> clear message
+        finally:
+            if saved is not None:
+                os.environ["FBT_ALERT_WEBHOOK"] = saved
+
+
 class FakeAlpacaTrading:
     """Stand-in for Alpaca's paper Trading API. Records every call."""
 

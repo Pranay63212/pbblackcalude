@@ -46,6 +46,8 @@ from .structure import session_levels
 MICRO = {"ES": "MES", "NQ": "MNQ", "YM": "MYM", "GC": "MGC"}
 DISCLAIMER = ("Alerts show setups that FIT the written rules. They are not predictions and not advice. "
               "No orders are placed.")
+TRADE_DISCLAIMER = ("Signals that FIT the written rules are traded in your Alpaca PAPER account (fake money) "
+                    "after risk-manager approval. Not predictions, not advice.")
 
 
 @dataclass
@@ -222,10 +224,16 @@ class Scanner:
         self._alerted: set = set()
 
     def active(self, now_ns: int) -> bool:
-        """Minutes when the scanner does work: from the pre-session mark-out through the session end."""
+        """Minutes when the scanner does work: weekdays, from the pre-session mark-out through the session end."""
         t = ns_to_chicago(now_ns)
         m = t.hour * 60 + t.minute
-        return min(self.premarket, self.start) <= m <= self.end
+        return self.trading_day(now_ns) and min(self.premarket, self.start) <= m <= self.end
+
+    @staticmethod
+    def trading_day(now_ns: int) -> bool:
+        """Monday-Friday in Chicago. (Exchange holidays are not known here; on a holiday the
+        scanner reports that no fresh data is arriving instead of trading.)"""
+        return ns_to_chicago(now_ns).dayofweek < 5
 
     def _news_event(self, now_ns: int):
         r = self.cfg["risk"]
@@ -236,7 +244,7 @@ class Scanner:
     def in_session(self, now_ns: int) -> bool:
         t = ns_to_chicago(now_ns)
         m = t.hour * 60 + t.minute
-        return self.start <= m <= self.end
+        return self.trading_day(now_ns) and self.start <= m <= self.end
 
     def evaluate(self, symbol: str, data: Dict[str, MultiTimeframeData], now_ns: int) -> Decision:
         view = data[symbol].view(now_ns)
@@ -253,6 +261,8 @@ class Scanner:
         events: List[ScanEvent] = []
         local = ns_to_chicago(now_ns)
         minute = local.hour * 60 + local.minute
+        if not self.trading_day(now_ns):
+            return events  # weekends: no summaries, no signals
         pre_window = self.premarket <= minute < max(self.start, self.premarket + 1)
         if pre_window and self.calendar is not None and self._news_done != local.date():
             self._news_done = local.date()
@@ -312,7 +322,25 @@ class AlertSink:
             try:
                 self.send(self.webhook, ev.text)
             except Exception as exc:  # an alert failure must not stop the scanner
-                self.echo(f"(webhook failed: {type(exc).__name__})")
+                self.echo(f"(webhook failed, phone alert not sent: {webhook_error(exc)})")
+
+
+def webhook_error(exc: Exception) -> str:
+    """Why a phone alert failed, in plain words, without printing the (private) channel URL."""
+    import urllib.error
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"the alert server answered HTTP {exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        reason = str(getattr(exc, "reason", exc))
+        if "getaddrinfo" in reason or "Name or service not known" in reason or "nodename" in reason:
+            return ("the alert address's website name could not be found - check FBT_ALERT_WEBHOOK is spelled "
+                    "https://ntfy.sh/<your-channel> (n-t-f-y)")
+        if "CERTIFICATE" in reason.upper():
+            return f"secure connection check failed ({reason})"
+        return f"could not connect ({reason})"
+    if isinstance(exc, ValueError):
+        return "FBT_ALERT_WEBHOOK is not a valid web address (it must start with https://)"
+    return f"{type(exc).__name__}: {exc}"
 
 
 def _post_webhook(url: str, text: str) -> None:
@@ -406,8 +434,9 @@ class LiveRunner:
                 if self.scanner.in_session(now_ns) and lag > self.stale:
                     if not self._stale_flag.get(sym):
                         events.append(ScanEvent(now_ns, sym, "STALE",
-                                                f"{sym} STALE DATA: last completed bar is {lag:.0f} min old; "
-                                                "not scanning until fresh bars arrive."))
+                                                f"{sym} NO FRESH DATA: last completed bar is {lag:.0f} min old "
+                                                "(market holiday, or a data problem); not scanning until fresh "
+                                                "bars arrive."))
                     self._stale_flag[sym] = True
                     continue
                 self._stale_flag[sym] = False
@@ -431,7 +460,7 @@ class LiveRunner:
 
     def run_forever(self, delay_after_close: float = 3.0) -> None:  # pragma: no cover - wall-clock loop
         self.warm_up()
-        print(DISCLAIMER)
+        print(TRADE_DISCLAIMER if self.trader is not None else DISCLAIMER)
         while True:
             now = pd.Timestamp.now(tz="UTC")
             nxt = now.floor("min") + pd.Timedelta(minutes=1, seconds=delay_after_close)
@@ -459,6 +488,22 @@ def replay_day(scanner: Scanner, data: Dict[str, MultiTimeframeData], date: str)
         events += scanner.scan(data, int(t.tz_convert("UTC").value))
         t += pd.Timedelta(minutes=1)
     return events
+
+
+def send_test_alert(env=None, send=None, echo: Callable[[str], None] = print) -> int:
+    """Send one notification through the same code path the scanner uses."""
+    env = os.environ if env is None else env
+    url = env.get("FBT_ALERT_WEBHOOK")
+    if not url:
+        echo("FBT_ALERT_WEBHOOK is not set in this window. Save it with setx, then open a NEW Command Prompt.")
+        return 2
+    try:
+        (send or _post_webhook)(url, "Test from your trading scanner: phone alerts work.")
+    except Exception as exc:
+        echo(f"Phone alert FAILED: {webhook_error(exc)}")
+        return 1
+    echo("Test alert sent. Check your phone.")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -493,6 +538,7 @@ def main(argv=None) -> int:
     lv.add_argument("--flatten-time", default="14:50", help="CT time to close open paper trades (ETFs close 15:00)")
     lv.add_argument("--push-summary", action="store_true",
                     help="also send the 08:25 CT pre-session summary to your phone (daily 'still running' check)")
+    sub.add_parser("test-alert", help="send one test notification to your phone (FBT_ALERT_WEBHOOK)")
     rp = sub.add_parser("replay")
     rp.add_argument("--data", required=True)
     rp.add_argument("--symbol", required=True)
@@ -505,6 +551,8 @@ def main(argv=None) -> int:
         sp.add_argument("--session", choices=["spec", "extended"], default="spec",
                         help="spec = signals 08:30-10:00 CT (default); extended = until 14:30 CT")
     args = ap.parse_args(argv)
+    if args.mode == "test-alert":
+        return send_test_alert()
     cfg = default_config(args.daily_limits, args.session)
 
     if args.mode == "replay":

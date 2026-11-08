@@ -31,6 +31,7 @@ from typing import Callable, List, Optional
 
 import pandas as pd
 
+from .net import ssl_context
 from .costs import CostModel, get_instrument
 from .data import CHICAGO, ns_to_chicago, parse_hhmm
 from .indicators import BULLISH
@@ -84,7 +85,7 @@ class AlpacaPaperBroker:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as resp:
                 raw = resp.read().decode()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:

@@ -1712,6 +1712,62 @@ class TestWeekendsAndAlertDiagnostics(unittest.TestCase):
                 os.environ["FBT_ALERT_WEBHOOK"] = saved
 
 
+class TestHttpsTrust(unittest.TestCase):
+    """Every HTTPS call uses the shared context: system store + certifi, verification always on."""
+
+    def test_context_never_weakens_verification(self):
+        import ssl
+        from fbt.net import ssl_context
+        ctx = ssl_context()
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+        self.assertGreater(ctx.cert_store_stats()["x509_ca"], 0)
+
+    def test_certifi_bundle_is_loaded_when_installed(self):
+        try:
+            import certifi
+        except ImportError:
+            self.skipTest("certifi not installed")
+        import ssl
+        from fbt.net import ssl_context
+        plain = ssl.create_default_context()
+        plain.load_verify_locations(cafile=certifi.where())
+        self.assertGreaterEqual(ssl_context().cert_store_stats()["x509_ca"], plain.cert_store_stats()["x509_ca"])
+
+    def test_all_https_calls_pass_the_shared_context(self):
+        import io
+        import json
+        import urllib.request
+        from fbt.econ import _get
+        from fbt.feeds import AlpacaFeed
+        from fbt.net import ssl_context
+        from fbt.scanner import _post_webhook
+        from fbt.trader import AlpacaPaperBroker
+        seen = []
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None, context=None):
+            seen.append(context)
+            return Resp(json.dumps({"bars": [], "equity": "1"}).encode())
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            _post_webhook("https://ntfy.sh/x", "hi")
+            _get("https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+            AlpacaFeed(env=TestPaperTrader.KEYS).recent("SPY")
+            AlpacaPaperBroker(RiskManager(default_config(), CostModel.default("SPY")), env=TestPaperTrader.KEYS).account()
+        finally:
+            urllib.request.urlopen = orig
+        self.assertEqual(len(seen), 4)
+        self.assertTrue(all(c is ssl_context() for c in seen))
+
+
 class FakeAlpacaTrading:
     """Stand-in for Alpaca's paper Trading API. Records every call."""
 

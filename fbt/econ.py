@@ -30,6 +30,7 @@ from typing import Iterable, List, Optional, Set
 
 import pandas as pd
 
+from .net import ssl_context
 from .data import CHICAGO, NS_PER_MIN
 
 FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
@@ -145,7 +146,7 @@ def _get(url: str, http=None) -> str:
     import urllib.request
     req = urllib.request.Request(url, headers=UA)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except Exception as exc:
         raise CalendarError(f"could not download {url}: {type(exc).__name__}") from None

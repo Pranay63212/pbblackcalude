@@ -24,6 +24,7 @@ from typing import Dict, Optional
 
 import pandas as pd
 
+from .net import ssl_context
 from .costs import EXCHANGES, get_instrument
 from .data import CHICAGO, DataError, load_ohlcv, validate_ohlcv
 
@@ -245,7 +246,7 @@ class AlpacaFeed:
         import urllib.request
         req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=ssl_context()) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as exc:
             if exc.code in (401, 403):

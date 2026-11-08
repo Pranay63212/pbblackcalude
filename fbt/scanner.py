@@ -36,6 +36,7 @@ from typing import Callable, Dict, List, Optional
 
 import pandas as pd
 
+from .net import ssl_context
 from .costs import ETFS, SMT_PAIRS, CostModel, get_instrument
 from .data import CHICAGO, DataError, MultiTimeframeData, load_ohlcv, ns_to_chicago, parse_hhmm
 from .feeds import completed_only, merge_bars, minutes_since_last_bar
@@ -349,7 +350,7 @@ def _post_webhook(url: str, text: str) -> None:
     else:
         body, ctype = text.encode(), "text/plain; charset=utf-8"
     req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype}, method="POST")
-    with urllib.request.urlopen(req, timeout=10):
+    with urllib.request.urlopen(req, timeout=10, context=ssl_context()):
         pass
 
 

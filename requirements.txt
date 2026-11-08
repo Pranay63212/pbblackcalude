@@ -1,5 +1,6 @@
 numpy>=1.26
 pandas>=2.1
+certifi>=2024.2.2  # up-to-date trusted certificates for HTTPS (alerts, Alpaca, calendar)
 # optional, only for reading .dbn.zst files:
 # databento>=0.40
 # optional, only for the live scanner's Interactive Brokers feed:

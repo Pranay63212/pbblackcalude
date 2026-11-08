@@ -287,6 +287,33 @@ python -m fbt.backtest ... --news-filter --news-file data/econ_calendar.csv --pa
   month (daily bullish vs 4H/1H bearish), so the pair filter blocked every ES trade, and no
   trade fell inside a news window.
 
+## Always-on in Google Cloud (free-tier VM)
+
+Measured needs: about 120 MB of memory and 0.15 s of work per minute for four symbols,
+so the free `e2-micro` machine (1 GB) is enough. Tests pass on Python 3.11 and 3.12.
+
+1. Google Cloud console -> Compute Engine -> VM instances -> Create instance:
+   region `us-central1` (Iowa), machine `e2-micro`, boot disk **Ubuntu 24.04 LTS**,
+   disk type **Standard persistent disk**, 30 GB (free-tier limits; other choices cost money).
+2. Click **SSH** next to the new VM and run:
+   ```bash
+   git clone https://github.com/Pranay63212/pbblackcalude
+   bash pbblackcalude/deploy/setup_gcp_vm.sh
+   ```
+   It installs everything, runs the tests, asks for your Alpaca PAPER keys and ntfy address
+   (saved only on the VM in `~/.pbblake.env`, owner-readable), sends a test alert, and
+   installs the `pbblake-scanner` systemd service: it starts now, after reboots, and 30 s after
+   any crash. Default flags: `--feed alpaca --trade --push-summary --daily-limits relaxed
+   --session extended --news-filter --pair-filter` (`FBT_FLAGS` in the env file; `--live` is refused).
+3. Daily use needs nothing. Useful commands on the VM:
+   `journalctl -u pbblake-scanner -f` (live log), `cat pbblackcalude/results/paper_trades.csv`,
+   `bash pbblackcalude/deploy/update.sh` (pull, test, restart only if tests pass),
+   `bash pbblackcalude/deploy/setup_gcp_vm.sh --reset-keys` (new keys).
+
+Stop the scanner on your home computer once the VM runs, so two copies do not trade the
+same paper account. Set a billing budget alert: depending on Google's current pricing, the
+VM's public IP address may not be covered by the free tier.
+
 ## Free real-data backtest (Yahoo Finance)
 
 ```bash

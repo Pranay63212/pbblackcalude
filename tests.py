@@ -1674,6 +1674,26 @@ class TestWeekendsAndAlertDiagnostics(unittest.TestCase):
         self.assertEqual(runner.step(), [])
         self.assertEqual(out, [])
 
+    def test_no_false_stale_alarm_at_the_open_after_a_weekend(self):
+        cfg = scenario_config()
+        df = bullish_scenario_df()
+        friday = df[df.index < ct("2024-03-08 15:00").tz_convert("UTC")]
+        feed = ReplayFeed({"ES": friday if len(friday) else df.iloc[:100]})
+        box = [ct("2024-03-11 08:30:03").tz_convert("UTC")]  # Monday open, last bar on Friday
+        feed.now = box[0]
+        out = []
+        sink = AlertSink(webhook="", echo=lambda t: None)
+        sink.emit = lambda e: out.append(e)
+        runner = LiveRunner(_fixed_scanner(cfg), feed, sink, clock=lambda: box[0])
+        runner.warm_up()
+        out.clear()
+        runner.step()
+        self.assertFalse(any(e.kind == "STALE" for e in out))
+        box[0] = ct("2024-03-11 08:40:03").tz_convert("UTC")  # still silent 10 min after the open
+        feed.now = box[0]
+        runner.step()
+        self.assertTrue(any(e.kind == "STALE" for e in out))
+
     def test_webhook_error_reasons_are_plain_and_hide_the_channel(self):
         import urllib.error
         from fbt.scanner import webhook_error

@@ -357,6 +357,12 @@ def _post_webhook(url: str, text: str) -> None:
 # ---------------------------------------------------------------------------
 # live loop
 # ---------------------------------------------------------------------------
+def _cash_open(now: pd.Timestamp) -> pd.Timestamp:
+    """Today's 08:30 CT US cash-market open, in UTC."""
+    local = now.tz_convert(CHICAGO)
+    return local.normalize().replace(hour=8, minute=30).tz_convert("UTC")
+
+
 class LiveRunner:
     """Polls a feed once a minute, keeps completed bars, rebuilds timeframes, scans."""
 
@@ -431,7 +437,11 @@ class LiveRunner:
             try:
                 new = completed_only(self.feed.recent(sym), now)
                 self.store[sym] = merge_bars(self.store.get(sym), new)
-                lag = minutes_since_last_bar(self.store[sym], now)
+                # Count the lag from the 08:30 CT cash open at the latest: weekend/overnight gaps are
+                # normal (IEX prints few pre-market bars), and at 08:30 the first regular bar has not
+                # closed yet. Only a feed that stays silent after the open is a real problem.
+                lag = min(minutes_since_last_bar(self.store[sym], now),
+                          (now - _cash_open(now)) / pd.Timedelta(minutes=1))
                 if self.scanner.in_session(now_ns) and lag > self.stale:
                     if not self._stale_flag.get(sym):
                         events.append(ScanEvent(now_ns, sym, "STALE",

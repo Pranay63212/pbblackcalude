@@ -190,7 +190,8 @@ class PaperTrader:
         if not self.state_path or not os.path.exists(self.state_path):
             return
         try:
-            st = json.load(open(self.state_path))
+            with open(self.state_path) as fh:
+                st = json.load(fh)
         except Exception:
             return
         today = str(pd.Timestamp.now(tz=CHICAGO).date())

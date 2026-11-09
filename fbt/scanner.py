@@ -234,7 +234,7 @@ class Scanner:
     def trading_day(now_ns: int) -> bool:
         """Monday-Friday in Chicago. (Exchange holidays are not known here; on a holiday the
         scanner reports that no fresh data is arriving instead of trading.)"""
-        return ns_to_chicago(now_ns).dayofweek < 5
+        return ns_to_chicago(now_ns).weekday() < 5
 
     def _news_event(self, now_ns: int):
         r = self.cfg["risk"]

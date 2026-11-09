@@ -135,7 +135,7 @@ def parse_faireconomy(items: list):
     if days:
         # the feed is one full Sunday-Saturday week: it covers every day of that week
         lo = pd.Timestamp(min(days))
-        sunday = lo - pd.Timedelta(days=(lo.dayofweek + 1) % 7)
+        sunday = lo - pd.Timedelta(days=(lo.weekday() + 1) % 7)
         days |= {(sunday + pd.Timedelta(days=k)).date() for k in range(7)}
     return events, days
 

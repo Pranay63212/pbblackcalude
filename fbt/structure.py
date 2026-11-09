@@ -606,7 +606,7 @@ def session_levels(view: MarketView) -> dict:
         out["taken_prev_day_high"] = out["overnight_high"] > out["prev_day_high"]
         out["taken_prev_day_low"] = out["overnight_low"] < out["prev_day_low"]
     today = local_now.date()
-    monday = pd.Timestamp(today) - pd.Timedelta(days=pd.Timestamp(today).dayofweek)
+    monday = pd.Timestamp(today) - pd.Timedelta(days=pd.Timestamp(today).weekday())
     prev_mon, prev_sun = (monday - pd.Timedelta(days=7)).date(), (monday - pd.Timedelta(days=1)).date()
     dates = [ns_to_chicago(int(t)).date() for t in d.close_time]
     idx = [k for k, dt in enumerate(dates) if prev_mon <= dt <= prev_sun]

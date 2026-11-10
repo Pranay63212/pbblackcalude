@@ -1796,6 +1796,7 @@ class FakeAlpacaTrading:
         self.base = PAPER_URL
         self.calls, self.positions, self.open, self.orders = [], [], [], {}
         self.equity = equity
+        self.shorting = True
         self.n = 0
 
     def __call__(self, method, url, headers, body):
@@ -1804,7 +1805,7 @@ class FakeAlpacaTrading:
         self.calls.append((method, url[len(self.base):], body))
         path = url[len(self.base):]
         if method == "GET" and path == "/account":
-            return {"equity": self.equity}
+            return {"equity": self.equity, "shorting_enabled": self.shorting}
         if method == "GET" and path == "/positions":
             return self.positions
         if method == "GET" and path.startswith("/orders?status=open"):
@@ -1867,6 +1868,15 @@ class TestPaperTrader(unittest.TestCase):
 
     def kinds(self, evs):
         return [e.kind for e in evs]
+
+    def test_short_signal_skipped_when_account_cannot_short(self):
+        self.api.shorting = False
+        evs = self.trader.on_minute(self.at("09:00"), [self.signal_event("09:00", BEARISH, 100.0, 102.0, 96.0)])
+        self.assertEqual(self.api.posts(), [])                       # no order sent
+        self.assertNotIn("ORDER_ERROR", self.kinds(evs))
+        self.assertTrue(any("shorting is turned off" in e.text.lower() for e in evs))
+        evs = self.trader.on_minute(self.at("09:05"), [self.signal_event("09:05", BULLISH)])
+        self.assertIn("ORDER", self.kinds(evs))                       # longs still trade
 
     def test_mode_is_paper_only(self):
         from fbt.trader import TradingError, build_paper_trader, resolve_trading_mode

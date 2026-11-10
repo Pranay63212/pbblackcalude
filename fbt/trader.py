@@ -183,6 +183,7 @@ class PaperTrader:
         self.open: Optional[OpenTrade] = None
         self._synced_day = None
         self._first_sync = True
+        self.can_short = True   # read from the Alpaca account each day
         self._load_state()
 
     # --- persistence (no keys, no account numbers)
@@ -234,6 +235,13 @@ class PaperTrader:
         self._first_sync = False
         self._synced_day = local.date()
         self._save_state()
+        # Alpaca refuses short sales when the account has shorting turned off (or under $2,000 equity)
+        self.can_short = acct.get("shorting_enabled") is not False
+        if not self.can_short:
+            return [TradeEvent(int(now.floor("min").value), "-", "SKIPPED",
+                               "Shorting is turned off on this Alpaca paper account: SHORT signals will be "
+                               "alerted but not traded. Turn it on in the Alpaca dashboard (paper account "
+                               "settings) to paper trade shorts.")]
         return []
 
     def _busy(self) -> Optional[str]:
@@ -268,6 +276,9 @@ class PaperTrader:
 
     def _enter(self, ev, now_ns: int, minute: int) -> List[TradeEvent]:
         sig = Signal(**ev.data["signal"])
+        if sig.direction != BULLISH and not self.can_short:
+            return [TradeEvent(now_ns, ev.symbol, "SKIPPED",
+                               f"{ev.symbol} SHORT signal not traded: shorting is turned off on this Alpaca account.")]
         busy = self._busy()
         if busy:
             return [TradeEvent(now_ns, ev.symbol, "SKIPPED", f"{ev.symbol} signal not traded: {busy}")]

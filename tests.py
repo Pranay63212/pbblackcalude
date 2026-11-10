@@ -1840,6 +1840,26 @@ class FakeAlpacaTrading:
         return [c for c in self.calls if c[0] == "POST"]
 
 
+class TestFuturesTranslation(unittest.TestCase):
+    def test_dia_short_converts_distances_to_ym_points(self):
+        from fbt.scanner import futures_lines
+        sig = make_signal(BEARISH, 520.96, 521.62, 519.64)
+        text = "\n".join(futures_lines(sig, "DIA"))
+        self.assertIn("SELL YM/MYM", text)
+        self.assertIn("stop 66 pts above", text)
+        self.assertIn("target 132 pts below", text)
+        self.assertIn("MYM $33.00", text)
+        self.assertIn("7 MYM", text)          # 7 x $33 = $231 <= $250
+        self.assertEqual(futures_lines(sig, "ES"), [])   # futures signals need no translation
+
+    def test_long_signal_sides(self):
+        from fbt.scanner import futures_lines
+        text = "\n".join(futures_lines(make_signal(BULLISH, 600.0, 599.0, 602.0), "SPY"))
+        self.assertIn("BUY ES/MES", text)
+        self.assertIn("stop 10.00 pts below", text)
+        self.assertIn("target 20.00 pts above", text)
+
+
 class TestPaperTrader(unittest.TestCase):
     KEYS = {"APCA_API_KEY_ID": "test-id-not-real", "APCA_API_SECRET_KEY": "test-secret-not-real"}
 

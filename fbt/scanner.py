@@ -45,6 +45,9 @@ from .strategy import Decision, PBBlakeStrategy
 from .structure import session_levels
 
 MICRO = {"ES": "MES", "NQ": "MNQ", "YM": "MYM", "GC": "MGC"}
+# ETF -> futures it stands in for, and the approximate futures/ETF price ratio. The ratios drift
+# (dividends, fees, interest), so alerts convert DISTANCES (stop/target in points), never prices.
+ETF_TO_FUTURES = {"SPY": ("ES", 10.0), "QQQ": ("NQ", 41.0), "DIA": ("YM", 100.0), "GLD": ("GC", 10.9)}
 DISCLAIMER = ("Alerts show setups that FIT the written rules. They are not predictions and not advice. "
               "No orders are placed.")
 TRADE_DISCLAIMER = ("Signals that FIT the written rules are traded in your Alpaca PAPER account (fake money) "
@@ -110,6 +113,30 @@ def sizing_lines(signal, symbol: str, config: dict) -> List[str]:
     return lines
 
 
+def futures_lines(signal, symbol: str, risk_dollars: float = 250.0) -> List[str]:
+    """For ETF signals: the same stop/target distances in futures points, for placing the trade by hand."""
+    if symbol not in ETF_TO_FUTURES:
+        return []
+    fut, ratio = ETF_TO_FUTURES[symbol]
+    big, micro = get_instrument(fut), get_instrument(MICRO[fut])
+
+    def pts(dist):
+        return max(big.tick_size, round(dist * ratio / big.tick_size) * big.tick_size)
+
+    stop_pts = pts(abs(signal.entry_price - signal.stop))
+    tgt_pts = pts(abs(signal.target - signal.entry_price))
+    stop_side, tgt_side = ("below", "above") if signal.direction == "BULLISH" else ("above", "below")
+    side = "BUY" if signal.direction == "BULLISH" else "SELL"
+    n_micro = int(risk_dollars // (stop_pts * micro.point_value))
+    fmt = (lambda x: f"{x:,.0f}") if big.tick_size >= 1 else (lambda x: f"{x:,.2f}")
+    return [
+        f"Futures (approx.): {side} {fut}/{micro.symbol} at market; stop {fmt(stop_pts)} pts {stop_side} your fill, "
+        f"target {fmt(tgt_pts)} pts {tgt_side}",
+        f"  risk per contract: {fut} ${stop_pts * big.point_value:,.0f}, {micro.symbol} "
+        f"${stop_pts * micro.point_value:,.2f}; {n_micro} {micro.symbol} = about ${risk_dollars:,.0f} risk",
+    ]
+
+
 def format_signal(symbol: str, d: Decision, config: dict) -> str:
     s = d.signal
     tick = get_instrument(symbol).tick_size
@@ -129,6 +156,7 @@ def format_signal(symbol: str, d: Decision, config: dict) -> str:
     if s.break_even_reference is not None:
         lines.append(f"Break-even reference {_px(s.break_even_reference, tick)} (configurable rule)")
     lines += sizing_lines(s, symbol, config)
+    lines += futures_lines(s, symbol)
     lim = config["execution"]["daily_limits"]
     lines.append(f"Your daily limits: max {lim['max_trades']} trades; stop after a win; after a loss only a new A+ setup.")
     return "\n".join(lines)

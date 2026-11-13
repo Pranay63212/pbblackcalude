@@ -78,12 +78,17 @@ class RiskManager:
         self._tokens = itertools.count(1)
         self._outstanding: Set[int] = set()
         self.position_open = False
+        # Broker buying power (cash-account style instruments such as ETFs); None = no cap known
+        self.buying_power: Optional[float] = None
 
     def use_costs(self, costs: CostModel) -> None:
         """Size the next approval for another instrument while keeping ONE shared account
         state (equity, daily limits, open position). Used when trading several markets."""
         self.costs = costs
         self.inst = costs.instrument
+
+    def set_buying_power(self, buying_power: Optional[float]) -> None:
+        self.buying_power = None if buying_power is None else max(0.0, float(buying_power))
 
     def set_equity(self, equity: float, reset_peak: bool = False) -> None:
         """Sync equity from the broker account (e.g. at the start of a day).
@@ -148,7 +153,12 @@ class RiskManager:
             return 0
         n = math.floor(risk_dollars / per_contract)
         cap = self.inst.max_units if self.inst.max_units is not None else self.risk["max_contracts"]
-        return int(max(0, min(n, cap)))
+        n = min(n, cap)
+        if self.buying_power is not None and self.inst.point_value == 1.0 and signal.entry_price > 0:
+            # shares: never order more than the broker lets us pay for (5% kept back for slippage).
+            # This only ever makes a position SMALLER, so the risk stays at or below the limit.
+            n = min(n, math.floor(self.buying_power * 0.95 / signal.entry_price))
+        return int(max(0, n))
 
     def approve(self, signal: Signal, now_ns: int, local_minute: int, has_position: bool):
         if has_position or self.position_open:

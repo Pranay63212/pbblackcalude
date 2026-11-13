@@ -1797,6 +1797,7 @@ class FakeAlpacaTrading:
         self.calls, self.positions, self.open, self.orders = [], [], [], {}
         self.equity = equity
         self.shorting = True
+        self.buying_power = None
         self.n = 0
 
     def __call__(self, method, url, headers, body):
@@ -1805,7 +1806,10 @@ class FakeAlpacaTrading:
         self.calls.append((method, url[len(self.base):], body))
         path = url[len(self.base):]
         if method == "GET" and path == "/account":
-            return {"equity": self.equity, "shorting_enabled": self.shorting}
+            acct = {"equity": self.equity, "shorting_enabled": self.shorting}
+            if self.buying_power is not None:
+                acct["buying_power"] = str(self.buying_power)
+            return acct
         if method == "GET" and path == "/positions":
             return self.positions
         if method == "GET" and path.startswith("/orders?status=open"):
@@ -1888,6 +1892,16 @@ class TestPaperTrader(unittest.TestCase):
 
     def kinds(self, evs):
         return [e.kind for e in evs]
+
+    def test_order_size_capped_by_buying_power(self):
+        # tight stop: 0.5% risk would need far more shares than the account can pay for
+        self.api.buying_power = 10_000.0
+        evs = self.trader.on_minute(self.at("09:00"), [self.signal_event("09:00", BULLISH, 100.0, 99.9, 100.2)])
+        self.assertIn("ORDER", self.kinds(evs))
+        qty = int(self.api.posts()[0][2]["qty"])
+        self.assertEqual(qty, 95)                      # floor(10,000 * 0.95 / 100)
+        self.assertLessEqual(qty * 100.0, 10_000.0)
+        self.assertTrue(any("buying power" in e.text for e in evs))
 
     def test_short_signal_skipped_when_account_cannot_short(self):
         self.api.shorting = False

@@ -165,6 +165,19 @@ class TradeEvent:
     data: dict = field(default_factory=dict)
 
 
+def _buying_power(acct: dict) -> Optional[float]:
+    """Alpaca's buying power for a new position (None if the account does not report it)."""
+    vals = []
+    for key in ("buying_power", "daytrading_buying_power"):
+        try:
+            v = float(acct.get(key))
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            vals.append(v)
+    return min(vals) if vals else None
+
+
 class PaperTrader:
     def __init__(self, config: dict, broker_factory: Callable[[RiskManager], AlpacaPaperBroker],
                  symbols: List[str], state_path: Optional[str] = "results/trader_state.json",
@@ -283,6 +296,7 @@ class PaperTrader:
         if busy:
             return [TradeEvent(now_ns, ev.symbol, "SKIPPED", f"{ev.symbol} signal not traded: {busy}")]
         self.risk.use_costs(CostModel.default(ev.symbol))
+        self.risk.set_buying_power(_buying_power(self.broker.account()))
         res = self.risk.approve(sig, now_ns, minute, has_position=False)
         if not isinstance(res, Approval):
             return [TradeEvent(now_ns, ev.symbol, "SKIPPED", f"{ev.symbol} signal not traded: {res.reason}")]
@@ -290,9 +304,14 @@ class PaperTrader:
         self.open = OpenTrade(ev.symbol, order["id"], sig.direction, int(res.contracts), sig.entry_price, sig.stop,
                               sig.target, sig.signal_time, sig.key_level_id)
         side = "BUY" if sig.direction == BULLISH else "SELL SHORT"
+        note = ""
+        bp, self.risk.buying_power = self.risk.buying_power, None
+        if bp is not None and self.risk.size(sig) > res.contracts:
+            note = f" Size cut to {res.contracts} by Alpaca buying power (${bp:,.0f}), so risk is below 0.5%."
+        self.risk.buying_power = bp
         return [TradeEvent(now_ns, ev.symbol, "ORDER",
                            f"PAPER ORDER {side} {res.contracts} {ev.symbol} at market; stop {sig.stop:.2f}, "
-                           f"target {sig.target:.2f} (bracket order, risk ${res.risk_dollars:,.2f})")]
+                           f"target {sig.target:.2f} (bracket order, risk ${res.risk_dollars:,.2f}).{note}")]
 
     def _track(self, now_ns: int, minute: int) -> List[TradeEvent]:
         t = self.open
